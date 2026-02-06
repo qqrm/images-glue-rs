@@ -1,3 +1,4 @@
+use js_sys::Reflect;
 use leptos::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -92,8 +93,8 @@ enum DragState {
         id: u64,
         pointer_dx: f64, // pointer_x - center_x
         insertion_index: usize,
-        pointer_x: f64,
-        pointer_y: f64,
+        _pointer_x: f64,
+        _pointer_y: f64,
     },
     Resize {
         id: u64,
@@ -141,7 +142,7 @@ async fn create_image_bitmap_from_file(file: &File) -> Result<ImageBitmap, JsVal
 async fn create_image_bitmap_from_blob(blob: &Blob) -> Result<ImageBitmap, JsValue> {
     let promise = window().create_image_bitmap_with_blob(blob)?;
     let js = JsFuture::from(promise).await?;
-    Ok(js.dyn_into::<ImageBitmap>()?)
+    js.dyn_into::<ImageBitmap>()
 }
 
 fn file_list_to_vec(files: &FileList) -> Vec<File> {
@@ -239,15 +240,15 @@ impl AppState {
 
         // clamp hovered/selected if items removed
         let ids: std::collections::HashSet<u64> = self.images.iter().map(|i| i.id).collect();
-        if let Some(id) = self.selected {
-            if !ids.contains(&id) {
-                self.selected = None;
-            }
+        if let Some(id) = self.selected
+            && !ids.contains(&id)
+        {
+            self.selected = None;
         }
-        if let Some(id) = self.hovered {
-            if !ids.contains(&id) {
-                self.hovered = None;
-            }
+        if let Some(id) = self.hovered
+            && !ids.contains(&id)
+        {
+            self.hovered = None;
         }
     }
 
@@ -400,11 +401,18 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         if is_sel || is_hov {
             ctx.save();
             ctx.set_line_width(if is_sel { 2.0 } else { 1.0 });
-            ctx.set_stroke_style(&JsValue::from_str(if is_sel {
-                "#66aaff"
-            } else {
-                "rgba(255,255,255,0.6)"
-            }));
+
+            Reflect::set(
+                ctx.as_ref(),
+                &JsValue::from_str("strokeStyle"),
+                &JsValue::from_str(if is_sel {
+                    "#66aaff"
+                } else {
+                    "rgba(255,255,255,0.6)"
+                }),
+            )
+            .unwrap();
+
             ctx.stroke_rect(it.x + 0.5, it.y + 0.5, it.w - 1.0, it.h - 1.0);
             ctx.restore();
         }
@@ -413,11 +421,30 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         if is_hov {
             let (bx, by, bw, bh) = it.delete_btn;
             ctx.save();
-            ctx.set_fill_style(&JsValue::from_str("rgba(0,0,0,0.55)"));
+
+            Reflect::set(
+                ctx.as_ref(),
+                &JsValue::from_str("fillStyle"),
+                &JsValue::from_str("rgba(0,0,0,0.55)"),
+            )
+            .unwrap();
             ctx.fill_rect(bx, by, bw, bh);
-            ctx.set_stroke_style(&JsValue::from_str("rgba(255,255,255,0.8)"));
+
+            Reflect::set(
+                ctx.as_ref(),
+                &JsValue::from_str("strokeStyle"),
+                &JsValue::from_str("rgba(255,255,255,0.8)"),
+            )
+            .unwrap();
             ctx.stroke_rect(bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0);
-            ctx.set_fill_style(&JsValue::from_str("rgba(255,255,255,0.9)"));
+
+            Reflect::set(
+                ctx.as_ref(),
+                &JsValue::from_str("fillStyle"),
+                &JsValue::from_str("rgba(255,255,255,0.9)"),
+            )
+            .unwrap();
+
             ctx.set_font("16px system-ui");
             ctx.set_text_align("center");
             ctx.set_text_baseline("middle");
@@ -428,22 +455,37 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
 
     // draw handles for selected (or hovered if nothing selected)
     let handle_owner = state.selected.or(state.hovered);
-    if let Some(id) = handle_owner {
-        if let Some(it) = state.layout.items.iter().find(|x| x.id == id) {
-            ctx.save();
-            ctx.set_fill_style(&JsValue::from_str("rgba(255,255,255,0.9)"));
-            ctx.set_stroke_style(&JsValue::from_str("rgba(0,0,0,0.6)"));
-            ctx.set_line_width(1.0);
-            let r = 5.5;
-            for (_h, hx, hy) in AppState::handle_points(it) {
-                ctx.begin_path();
-                let _ = ctx.arc(hx, hy, r, 0.0, std::f64::consts::TAU);
-                ctx.close_path();
-                ctx.fill();
-                ctx.stroke();
-            }
-            ctx.restore();
+    if let Some(id) = handle_owner
+        && let Some(it) = state.layout.items.iter().find(|x| x.id == id)
+    {
+        ctx.save();
+
+        Reflect::set(
+            ctx.as_ref(),
+            &JsValue::from_str("fillStyle"),
+            &JsValue::from_str("rgba(255,255,255,0.9)"),
+        )
+        .unwrap();
+
+        Reflect::set(
+            ctx.as_ref(),
+            &JsValue::from_str("strokeStyle"),
+            &JsValue::from_str("rgba(0,0,0,0.6)"),
+        )
+        .unwrap();
+
+        ctx.set_line_width(1.0);
+
+        let r = 5.5;
+        for (_h, hx, hy) in AppState::handle_points(it) {
+            ctx.begin_path();
+            let _ = ctx.arc(hx, hy, r, 0.0, std::f64::consts::TAU);
+            ctx.close_path();
+            ctx.fill();
+            ctx.stroke();
         }
+
+        ctx.restore();
     }
 
     // insertion marker while reordering
@@ -466,7 +508,14 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             idx += 1;
         }
         ctx.save();
-        ctx.set_stroke_style(&JsValue::from_str("rgba(255,255,255,0.9)"));
+
+        Reflect::set(
+            ctx.as_ref(),
+            &JsValue::from_str("strokeStyle"),
+            &JsValue::from_str("rgba(255,255,255,0.9)"),
+        )
+        .unwrap();
+
         ctx.set_line_width(2.0);
         ctx.begin_path();
         ctx.move_to(x + 0.5, 0.0);
@@ -534,7 +583,12 @@ fn export_current(state: &AppState) {
 
     // background
     if state.export_format == ExportFormat::Jpeg {
-        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
+        Reflect::set(
+            ctx.as_ref(),
+            &JsValue::from_str("fillStyle"),
+            &JsValue::from_str("#ffffff"),
+        )
+        .unwrap();
         ctx.fill_rect(0.0, 0.0, out_w as f64, out_h as f64);
     } else {
         // PNG: transparent by default
@@ -593,10 +647,20 @@ fn export_current(state: &AppState) {
             args.push(&JsValue::from_f64(0.9));
             let _ = f.apply(&this, &args);
         } else {
-            let _ = canvas.to_blob_with_type(cb.as_ref().dyn_ref::<js_sys::Function>().expect("toBlob cb"), mime);
+            let _ = canvas.to_blob_with_type(
+                cb.as_ref()
+                    .dyn_ref::<js_sys::Function>()
+                    .expect("toBlob cb"),
+                mime,
+            );
         }
     } else {
-        let _ = canvas.to_blob_with_type(cb.as_ref().dyn_ref::<js_sys::Function>().expect("toBlob cb"), mime);
+        let _ = canvas.to_blob_with_type(
+            cb.as_ref()
+                .dyn_ref::<js_sys::Function>()
+                .expect("toBlob cb"),
+            mime,
+        );
     }
     cb.forget();
 }
@@ -609,8 +673,7 @@ fn App() -> impl IntoView {
     let state = RwSignal::new_local(AppState::default());
 
     // render effect
-    create_effect({
-        let canvas_ref = canvas_ref.clone();
+    Effect::new({
         move |_| {
             state.with(|s| {
                 if let Some(canvas) = canvas_ref.get() {
@@ -622,7 +685,6 @@ fn App() -> impl IntoView {
 
     // global paste handler
     {
-        let state = state.clone();
         let closure = Closure::<dyn FnMut(ClipboardEvent)>::new(move |ev: ClipboardEvent| {
             let Some(data) = ev.clipboard_data() else {
                 return;
@@ -635,9 +697,8 @@ fn App() -> impl IntoView {
                         continue;
                     }
                     if let Ok(Some(file)) = it.get_as_file() {
-                        let state2 = state.clone();
                         wasm_bindgen_futures::spawn_local(async move {
-                            append_files(state2, vec![file]).await;
+                            append_files(state, vec![file]).await;
                         });
                         // accept the first image from this paste event
                         break;
@@ -646,31 +707,41 @@ fn App() -> impl IntoView {
             }
         });
         window()
-            .add_event_listener_with_callback("paste", closure.as_ref().dyn_ref::<js_sys::Function>().expect("paste fn"))
+            .add_event_listener_with_callback(
+                "paste",
+                closure
+                    .as_ref()
+                    .dyn_ref::<js_sys::Function>()
+                    .expect("paste fn"),
+            )
             .expect("paste listener");
         closure.forget();
     }
 
     // global keydown: Ctrl/Cmd+S export
     {
-        let state = state.clone();
         let closure =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 let key = ev.key();
                 if (ev.ctrl_key() || ev.meta_key()) && (key == "s" || key == "S") {
                     ev.prevent_default();
-                    state.with(|s| export_current(s));
+                    state.with(export_current);
                 }
             });
         window()
-            .add_event_listener_with_callback("keydown", closure.as_ref().dyn_ref::<js_sys::Function>().expect("keydown fn"))
+            .add_event_listener_with_callback(
+                "keydown",
+                closure
+                    .as_ref()
+                    .dyn_ref::<js_sys::Function>()
+                    .expect("keydown fn"),
+            )
             .expect("keydown listener");
         closure.forget();
     }
 
     // file input onchange
     let on_files = {
-        let state = state.clone();
         move |_| {
             let Some(input) = file_ref.get() else { return };
             let Some(files) = input.files() else { return };
@@ -688,7 +759,6 @@ fn App() -> impl IntoView {
         ev.prevent_default();
     };
     let on_drop = {
-        let state = state.clone();
         move |ev: DragEvent| {
             ev.prevent_default();
             let Some(dt) = ev.data_transfer() else { return };
@@ -703,8 +773,6 @@ fn App() -> impl IntoView {
 
     // pointer handlers on canvas
     let on_pointer_move = {
-        let state = state.clone();
-        let canvas_ref = canvas_ref.clone();
         move |ev: PointerEvent| {
             let Some(canvas) = canvas_ref.get() else {
                 return;
@@ -728,8 +796,8 @@ fn App() -> impl IntoView {
                                 id,
                                 pointer_dx,
                                 insertion_index: insertion,
-                                pointer_x: px,
-                                pointer_y: py,
+                                _pointer_x: px,
+                                _pointer_y: py,
                             });
                         }
                         DragState::Resize {
@@ -839,7 +907,6 @@ fn App() -> impl IntoView {
     };
 
     let on_pointer_down = {
-        let state = state.clone();
         move |ev: PointerEvent| {
             let px = ev.offset_x() as f64;
             let py = ev.offset_y() as f64;
@@ -910,15 +977,14 @@ fn App() -> impl IntoView {
                     id,
                     pointer_dx,
                     insertion_index: insertion,
-                    pointer_x: px,
-                    pointer_y: py,
+                    _pointer_x: px,
+                    _pointer_y: py,
                 });
             });
         }
     };
 
     let on_pointer_up = {
-        let state = state.clone();
         move |_ev: PointerEvent| {
             state.update(|s| {
                 if let Some(DragState::Reorder {
@@ -936,7 +1002,6 @@ fn App() -> impl IntoView {
 
     // controls
     let on_toggle_aspect = {
-        let state = state.clone();
         move |ev| {
             let checked = event_target_checked(&ev);
             state.update(|s| {
@@ -959,7 +1024,6 @@ fn App() -> impl IntoView {
     };
 
     let on_slider = {
-        let state = state.clone();
         move |ev| {
             let v = event_target_value(&ev).parse::<f64>().unwrap_or(0.5);
             state.update(|s| {
@@ -970,7 +1034,6 @@ fn App() -> impl IntoView {
     };
 
     let on_format = {
-        let state = state.clone();
         move |ev| {
             let v = event_target_value(&ev);
             state.update(|s| {
@@ -984,14 +1047,13 @@ fn App() -> impl IntoView {
     };
 
     let on_save_click = {
-        let state = state.clone();
         move |_| {
-            state.with(|s| export_current(s));
+            state.with(export_current);
         }
     };
 
     // Derived strings
-    let warn = create_memo(move |_| state.with(|s| s.layout.warn_too_large));
+    let warn = Memo::new(move |_| state.with(|s| s.layout.warn_too_large));
 
     view! {
         <div class="main" on:dragover=on_drag_over on:drop=on_drop>
