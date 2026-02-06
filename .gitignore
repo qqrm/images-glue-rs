@@ -1,2 +1,4 @@
 /target
-**.zip
+/dist
+/.trunk
+**/*.rs.bk
