@@ -70,6 +70,8 @@ struct Layout {
     items: Vec<LayoutItem>,
     out_w: f64,
     out_h: f64,
+    view_w: f64,
+    view_h: f64,
     warn_too_large: bool,
 }
 
@@ -233,6 +235,10 @@ impl AppState {
         layout.out_w = x;
         layout.out_h = out_h;
 
+        // Workspace should stay larger than glued content so images can be stretched to the right/bottom.
+        layout.view_w = (layout.out_w + 1200.0).max(1600.0);
+        layout.view_h = (layout.out_h + 900.0).max(900.0);
+
         // warning: typical max canvas dimension (varies by browser/GPU)
         layout.warn_too_large = layout.out_w > 16384.0 || layout.out_h > 16384.0;
 
@@ -376,9 +382,9 @@ fn set_canvas_size(
 }
 
 fn render(state: &AppState, canvas: &HtmlCanvasElement) {
-    // Determine logical output size.
-    let w = state.layout.out_w.max(1.0);
-    let h = state.layout.out_h.max(1.0);
+    // Preview canvas is intentionally larger than content bounds.
+    let w = state.layout.view_w.max(1.0);
+    let h = state.layout.view_h.max(1.0);
 
     let Some((ctx, _dpr)) = set_canvas_size(canvas, w, h) else {
         return;
@@ -557,9 +563,9 @@ async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<Fi
     }
 }
 
-fn export_current(state: &AppState) {
+fn render_output_canvas(state: &AppState, format: ExportFormat) -> Option<HtmlCanvasElement> {
     if state.images.is_empty() {
-        return;
+        return None;
     }
 
     let out_w = state.layout.out_w.round().max(1.0) as u32;
@@ -581,8 +587,7 @@ fn export_current(state: &AppState) {
         .dyn_into()
         .unwrap();
 
-    // background
-    if state.export_format == ExportFormat::Jpeg {
+    if format == ExportFormat::Jpeg {
         Reflect::set(
             ctx.as_ref(),
             &JsValue::from_str("fillStyle"),
@@ -591,17 +596,50 @@ fn export_current(state: &AppState) {
         .unwrap();
         ctx.fill_rect(0.0, 0.0, out_w as f64, out_h as f64);
     } else {
-        // PNG: transparent by default
         ctx.clear_rect(0.0, 0.0, out_w as f64, out_h as f64);
     }
 
-    // draw images
     for it in &state.layout.items {
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
             let _ =
                 ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, it.x, it.y, it.w, it.h);
         }
     }
+
+    Some(canvas)
+}
+
+fn copy_current_to_clipboard(state: &AppState) {
+    let Some(canvas) = render_output_canvas(state, ExportFormat::Png) else {
+        return;
+    };
+
+    let cb = Closure::<dyn FnMut(JsValue)>::new(move |blob_js: JsValue| {
+        if blob_js.is_null() || blob_js.is_undefined() {
+            return;
+        }
+        let blob: Blob = blob_js.dyn_into().unwrap();
+
+        let f = js_sys::Function::new_with_args(
+            "blob",
+            "if (!navigator.clipboard || !window.ClipboardItem) return Promise.reject('clipboard unavailable');\n             return navigator.clipboard.write([new ClipboardItem({'image/png': blob})]);",
+        );
+        let _ = f.call1(&JsValue::NULL, &blob.into());
+    });
+
+    let _ = canvas.to_blob_with_type(
+        cb.as_ref()
+            .dyn_ref::<js_sys::Function>()
+            .expect("toBlob cb"),
+        ExportFormat::Png.mime(),
+    );
+    cb.forget();
+}
+
+fn export_current(state: &AppState) {
+    let Some(canvas) = render_output_canvas(state, state.export_format) else {
+        return;
+    };
 
     let mime = state.export_format.mime();
     let ext = state.export_format.ext();
@@ -632,9 +670,7 @@ fn export_current(state: &AppState) {
         Url::revoke_object_url(&url).ok();
     });
 
-    // to_blob is callback-based (JPEG uses explicit quality=0.9 via JS call)
     if state.export_format == ExportFormat::Jpeg {
-        // web-sys may not expose the quality overload on all versions, so call `canvas.toBlob(cb, mime, quality)` via JS.
         let to_blob = js_sys::Reflect::get(canvas.as_ref(), &JsValue::from_str("toBlob"))
             .ok()
             .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
@@ -718,14 +754,19 @@ fn App() -> impl IntoView {
         closure.forget();
     }
 
-    // global keydown: Ctrl/Cmd+S export
+    // global keydown: save/copy shortcuts
     {
         let closure =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 let key = ev.key();
-                if (ev.ctrl_key() || ev.meta_key()) && (key == "s" || key == "S") {
-                    ev.prevent_default();
-                    state.with(export_current);
+                if ev.ctrl_key() || ev.meta_key() {
+                    if key == "s" || key == "S" {
+                        ev.prevent_default();
+                        state.with(export_current);
+                    } else if key == "c" || key == "C" {
+                        ev.prevent_default();
+                        state.with(copy_current_to_clipboard);
+                    }
                 }
             });
         window()
@@ -1052,6 +1093,12 @@ fn App() -> impl IntoView {
         }
     };
 
+    let on_copy_click = {
+        move |_| {
+            state.with(copy_current_to_clipboard);
+        }
+    };
+
     // Derived strings
     let warn = Memo::new(move |_| state.with(|s| s.layout.warn_too_large));
 
@@ -1093,9 +1140,10 @@ fn App() -> impl IntoView {
                     </select>
                 </label>
 
-                <button on:click=on_save_click>"Save (Ctrl+S)"</button>
+                <button on:click=on_save_click>"Save (Ctrl+S / Ctrl+Shift+S)"</button>
+                <button on:click=on_copy_click>"Copy image (Ctrl+C)"</button>
 
-                <div class="hint">"Paste images with Ctrl/Cmd+V. Drag to reorder. Handles to resize. Hover × to delete."</div>
+                <div class="hint">"Paste with Ctrl/Cmd+V. Drag to reorder. Use corner handles to stretch right/down. Hover × to delete."</div>
                 {move || warn.get().then(|| view! { <div class="warn">"Warning: output may exceed typical canvas limits (16384px)."</div> })}
             </div>
 
