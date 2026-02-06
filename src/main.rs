@@ -7,6 +7,11 @@ use web_sys::{
     ImageBitmap, PointerEvent, Url, Window,
 };
 
+const HANDLE_DRAW_RADIUS: f64 = 9.0;
+const HANDLE_HIT_RADIUS: f64 = 14.0;
+const HANDLE_OUTSET: f64 = 8.0;
+const DELETE_BTN_SIZE: f64 = 26.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportFormat {
     Jpeg,
@@ -88,9 +93,10 @@ struct AppState {
 
 #[derive(Clone, Debug)]
 enum DragState {
-    Reorder {
+    Move {
         id: u64,
-        pointer_dx: f64, // pointer_x - center_x
+        pointer_offset_x: f64,
+        pointer_offset_y: f64,
         insertion_index: usize,
         pointer_x: f64,
         pointer_y: f64,
@@ -141,7 +147,7 @@ async fn create_image_bitmap_from_file(file: &File) -> Result<ImageBitmap, JsVal
 async fn create_image_bitmap_from_blob(blob: &Blob) -> Result<ImageBitmap, JsValue> {
     let promise = window().create_image_bitmap_with_blob(blob)?;
     let js = JsFuture::from(promise).await?;
-    Ok(js.dyn_into::<ImageBitmap>()?)
+    js.dyn_into::<ImageBitmap>()
 }
 
 fn file_list_to_vec(files: &FileList) -> Vec<File> {
@@ -211,8 +217,8 @@ impl AppState {
             };
 
             let btn = {
-                let pad = 4.0;
-                let sz = 18.0;
+                let pad = 6.0;
+                let sz = DELETE_BTN_SIZE;
                 (x + w - sz - pad, 0.0 + pad, sz, sz)
             };
 
@@ -239,15 +245,15 @@ impl AppState {
 
         // clamp hovered/selected if items removed
         let ids: std::collections::HashSet<u64> = self.images.iter().map(|i| i.id).collect();
-        if let Some(id) = self.selected {
-            if !ids.contains(&id) {
-                self.selected = None;
-            }
+        if let Some(id) = self.selected
+            && !ids.contains(&id)
+        {
+            self.selected = None;
         }
-        if let Some(id) = self.hovered {
-            if !ids.contains(&id) {
-                self.hovered = None;
-            }
+        if let Some(id) = self.hovered
+            && !ids.contains(&id)
+        {
+            self.hovered = None;
         }
     }
 
@@ -275,25 +281,33 @@ impl AppState {
         let w = it.w;
         let h = it.h;
         [
-            (Handle::NW, x, y),
-            (Handle::N, x + w / 2.0, y),
-            (Handle::NE, x + w, y),
-            (Handle::E, x + w, y + h / 2.0),
-            (Handle::SE, x + w, y + h),
-            (Handle::S, x + w / 2.0, y + h),
-            (Handle::SW, x, y + h),
-            (Handle::W, x, y + h / 2.0),
+            (Handle::NW, x - HANDLE_OUTSET, y - HANDLE_OUTSET),
+            (Handle::N, x + w / 2.0, y - HANDLE_OUTSET),
+            (Handle::NE, x + w + HANDLE_OUTSET, y - HANDLE_OUTSET),
+            (Handle::E, x + w + HANDLE_OUTSET, y + h / 2.0),
+            (Handle::SE, x + w + HANDLE_OUTSET, y + h + HANDLE_OUTSET),
+            (Handle::S, x + w / 2.0, y + h + HANDLE_OUTSET),
+            (Handle::SW, x - HANDLE_OUTSET, y + h + HANDLE_OUTSET),
+            (Handle::W, x - HANDLE_OUTSET, y + h / 2.0),
         ]
     }
 
     fn hit_test_handle(&self, id: u64, px: f64, py: f64) -> Option<Handle> {
         let it = self.layout.items.iter().find(|x| x.id == id)?;
-        let r = 8.0;
         for (h, hx, hy) in Self::handle_points(it) {
             let dx = px - hx;
             let dy = py - hy;
-            if dx * dx + dy * dy <= r * r {
+            if dx * dx + dy * dy <= HANDLE_HIT_RADIUS * HANDLE_HIT_RADIUS {
                 return Some(h);
+            }
+        }
+        None
+    }
+
+    fn hit_test_handle_any(&self, px: f64, py: f64) -> Option<(u64, Handle)> {
+        for it in &self.layout.items {
+            if let Some(handle) = self.hit_test_handle(it.id, px, py) {
+                return Some((it.id, handle));
             }
         }
         None
@@ -387,9 +401,17 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     // For JPEG export we will draw white, but preview remains neutral.
     ctx.clear_rect(0.0, 0.0, w, h);
 
+    let dragged_id = if let Some(DragState::Move { id, .. }) = &state.drag {
+        Some(*id)
+    } else {
+        None
+    };
+
     // draw images
     for it in &state.layout.items {
-        if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
+        if Some(it.id) != dragged_id
+            && let Some(img) = state.images.iter().find(|i| i.id == it.id)
+        {
             // draw the bitmap
             let _ =
                 ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, it.x, it.y, it.w, it.h);
@@ -400,11 +422,11 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         if is_sel || is_hov {
             ctx.save();
             ctx.set_line_width(if is_sel { 2.0 } else { 1.0 });
-            ctx.set_stroke_style(&JsValue::from_str(if is_sel {
+            ctx.set_stroke_style_str(if is_sel {
                 "#66aaff"
             } else {
                 "rgba(255,255,255,0.6)"
-            }));
+            });
             ctx.stroke_rect(it.x + 0.5, it.y + 0.5, it.w - 1.0, it.h - 1.0);
             ctx.restore();
         }
@@ -413,41 +435,72 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         if is_hov {
             let (bx, by, bw, bh) = it.delete_btn;
             ctx.save();
-            ctx.set_fill_style(&JsValue::from_str("rgba(0,0,0,0.55)"));
+            ctx.set_fill_style_str("rgba(120,0,0,0.75)");
             ctx.fill_rect(bx, by, bw, bh);
-            ctx.set_stroke_style(&JsValue::from_str("rgba(255,255,255,0.8)"));
+            ctx.set_stroke_style_str("rgba(255,80,80,0.95)");
+            ctx.set_line_width(1.5);
             ctx.stroke_rect(bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0);
-            ctx.set_fill_style(&JsValue::from_str("rgba(255,255,255,0.9)"));
-            ctx.set_font("16px system-ui");
+            ctx.set_fill_style_str("rgba(255,100,100,1.0)");
+            ctx.set_font("22px system-ui");
             ctx.set_text_align("center");
             ctx.set_text_baseline("middle");
-            let _ = ctx.fill_text("×", bx + bw / 2.0, by + bh / 2.0 + 0.5);
+            let _ = ctx.fill_text("×", bx + bw / 2.0, by + bh / 2.0 + 1.0);
             ctx.restore();
         }
     }
 
     // draw handles for selected (or hovered if nothing selected)
     let handle_owner = state.selected.or(state.hovered);
-    if let Some(id) = handle_owner {
-        if let Some(it) = state.layout.items.iter().find(|x| x.id == id) {
+    if let Some(id) = handle_owner
+        && let Some(it) = state.layout.items.iter().find(|x| x.id == id)
+    {
+        ctx.save();
+        ctx.set_fill_style_str("rgba(255,255,255,0.9)");
+        ctx.set_stroke_style_str("rgba(0,0,0,0.6)");
+        ctx.set_line_width(1.2);
+        let r = HANDLE_DRAW_RADIUS;
+        for (_h, hx, hy) in AppState::handle_points(it) {
+            ctx.begin_path();
+            let _ = ctx.arc(hx, hy, r, 0.0, std::f64::consts::TAU);
+            ctx.close_path();
+            ctx.fill();
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    if let Some(DragState::Move {
+        id,
+        pointer_offset_x,
+        pointer_offset_y,
+        pointer_x,
+        pointer_y,
+        ..
+    }) = &state.drag
+        && let Some(it) = state.layout.items.iter().find(|x| x.id == *id)
+    {
+        let draw_x = pointer_x - pointer_offset_x;
+        let draw_y = pointer_y - pointer_offset_y;
+        if let Some(img) = state.images.iter().find(|i| i.id == *id) {
             ctx.save();
-            ctx.set_fill_style(&JsValue::from_str("rgba(255,255,255,0.9)"));
-            ctx.set_stroke_style(&JsValue::from_str("rgba(0,0,0,0.6)"));
-            ctx.set_line_width(1.0);
-            let r = 5.5;
-            for (_h, hx, hy) in AppState::handle_points(it) {
-                ctx.begin_path();
-                let _ = ctx.arc(hx, hy, r, 0.0, std::f64::consts::TAU);
-                ctx.close_path();
-                ctx.fill();
-                ctx.stroke();
-            }
+            ctx.set_global_alpha(0.85);
+            let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+                &img.bitmap,
+                draw_x,
+                draw_y,
+                it.w,
+                it.h,
+            );
+            ctx.set_global_alpha(1.0);
+            ctx.set_stroke_style_str("rgba(255,255,255,0.9)");
+            ctx.set_line_width(2.0);
+            ctx.stroke_rect(draw_x + 0.5, draw_y + 0.5, it.w - 1.0, it.h - 1.0);
             ctx.restore();
         }
     }
 
     // insertion marker while reordering
-    if let Some(DragState::Reorder {
+    if let Some(DragState::Move {
         id,
         insertion_index,
         ..
@@ -466,7 +519,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             idx += 1;
         }
         ctx.save();
-        ctx.set_stroke_style(&JsValue::from_str("rgba(255,255,255,0.9)"));
+        ctx.set_stroke_style_str("rgba(255,255,255,0.9)");
         ctx.set_line_width(2.0);
         ctx.begin_path();
         ctx.move_to(x + 0.5, 0.0);
@@ -508,6 +561,27 @@ async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<Fi
     }
 }
 
+fn draw_output_to_canvas(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    state: &AppState,
+    out_w: f64,
+    out_h: f64,
+) {
+    if state.export_format == ExportFormat::Jpeg {
+        ctx.set_fill_style_str("#ffffff");
+        ctx.fill_rect(0.0, 0.0, out_w, out_h);
+    } else {
+        ctx.clear_rect(0.0, 0.0, out_w, out_h);
+    }
+
+    for it in &state.layout.items {
+        if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
+            let _ =
+                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, it.x, it.y, it.w, it.h);
+        }
+    }
+}
+
 fn export_current(state: &AppState) {
     if state.images.is_empty() {
         return;
@@ -532,22 +606,7 @@ fn export_current(state: &AppState) {
         .dyn_into()
         .unwrap();
 
-    // background
-    if state.export_format == ExportFormat::Jpeg {
-        ctx.set_fill_style(&JsValue::from_str("#ffffff"));
-        ctx.fill_rect(0.0, 0.0, out_w as f64, out_h as f64);
-    } else {
-        // PNG: transparent by default
-        ctx.clear_rect(0.0, 0.0, out_w as f64, out_h as f64);
-    }
-
-    // draw images
-    for it in &state.layout.items {
-        if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
-            let _ =
-                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, it.x, it.y, it.w, it.h);
-        }
-    }
+    draw_output_to_canvas(&ctx, state, out_w as f64, out_h as f64);
 
     let mime = state.export_format.mime();
     let ext = state.export_format.ext();
@@ -593,11 +652,94 @@ fn export_current(state: &AppState) {
             args.push(&JsValue::from_f64(0.9));
             let _ = f.apply(&this, &args);
         } else {
-            let _ = canvas.to_blob_with_type(cb.as_ref().dyn_ref::<js_sys::Function>().expect("toBlob cb"), mime);
+            let _ = canvas.to_blob_with_type(
+                cb.as_ref()
+                    .dyn_ref::<js_sys::Function>()
+                    .expect("toBlob cb"),
+                mime,
+            );
         }
     } else {
-        let _ = canvas.to_blob_with_type(cb.as_ref().dyn_ref::<js_sys::Function>().expect("toBlob cb"), mime);
+        let _ = canvas.to_blob_with_type(
+            cb.as_ref()
+                .dyn_ref::<js_sys::Function>()
+                .expect("toBlob cb"),
+            mime,
+        );
     }
+    cb.forget();
+}
+
+fn copy_current_to_clipboard(state: &AppState) {
+    if state.images.is_empty() {
+        return;
+    }
+
+    let out_w = state.layout.out_w.round().max(1.0) as u32;
+    let out_h = state.layout.out_h.round().max(1.0) as u32;
+
+    let doc = window().document().expect("document");
+    let canvas: HtmlCanvasElement = doc
+        .create_element("canvas")
+        .expect("create canvas")
+        .dyn_into()
+        .expect("canvas");
+    canvas.set_width(out_w);
+    canvas.set_height(out_h);
+
+    let ctx: web_sys::CanvasRenderingContext2d = canvas
+        .get_context("2d")
+        .expect("ctx")
+        .expect("2d ctx")
+        .dyn_into()
+        .expect("canvas 2d");
+
+    let mut copy_state = state.clone();
+    copy_state.export_format = ExportFormat::Png;
+    draw_output_to_canvas(&ctx, &copy_state, out_w as f64, out_h as f64);
+
+    let cb = Closure::<dyn FnMut(JsValue)>::new(move |blob_js: JsValue| {
+        if blob_js.is_null() || blob_js.is_undefined() {
+            return;
+        }
+
+        let win = window();
+        let navigator = js_sys::Reflect::get(win.as_ref(), &JsValue::from_str("navigator")).ok();
+        let Some(navigator) = navigator else { return };
+
+        let clipboard = js_sys::Reflect::get(&navigator, &JsValue::from_str("clipboard")).ok();
+        let Some(clipboard) = clipboard else { return };
+
+        let ctor = js_sys::Reflect::get(&window(), &JsValue::from_str("ClipboardItem"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+        let Some(ctor) = ctor else { return };
+
+        let data = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&data, &JsValue::from_str("image/png"), &blob_js);
+
+        let args = js_sys::Array::new();
+        args.push(&data);
+        let item = js_sys::Reflect::construct(&ctor, &args).ok();
+        let Some(item) = item else { return };
+
+        let items = js_sys::Array::new();
+        items.push(&item);
+
+        let write_fn = js_sys::Reflect::get(&clipboard, &JsValue::from_str("write"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+        let Some(write_fn) = write_fn else { return };
+
+        let _ = write_fn.call1(&clipboard, &items);
+    });
+
+    let _ = canvas.to_blob_with_type(
+        cb.as_ref()
+            .dyn_ref::<js_sys::Function>()
+            .expect("toBlob cb"),
+        "image/png",
+    );
     cb.forget();
 }
 
@@ -609,8 +751,7 @@ fn App() -> impl IntoView {
     let state = RwSignal::new_local(AppState::default());
 
     // render effect
-    create_effect({
-        let canvas_ref = canvas_ref.clone();
+    Effect::new({
         move |_| {
             state.with(|s| {
                 if let Some(canvas) = canvas_ref.get() {
@@ -622,7 +763,6 @@ fn App() -> impl IntoView {
 
     // global paste handler
     {
-        let state = state.clone();
         let closure = Closure::<dyn FnMut(ClipboardEvent)>::new(move |ev: ClipboardEvent| {
             let Some(data) = ev.clipboard_data() else {
                 return;
@@ -635,7 +775,7 @@ fn App() -> impl IntoView {
                         continue;
                     }
                     if let Ok(Some(file)) = it.get_as_file() {
-                        let state2 = state.clone();
+                        let state2 = state;
                         wasm_bindgen_futures::spawn_local(async move {
                             append_files(state2, vec![file]).await;
                         });
@@ -646,31 +786,45 @@ fn App() -> impl IntoView {
             }
         });
         window()
-            .add_event_listener_with_callback("paste", closure.as_ref().dyn_ref::<js_sys::Function>().expect("paste fn"))
+            .add_event_listener_with_callback(
+                "paste",
+                closure
+                    .as_ref()
+                    .dyn_ref::<js_sys::Function>()
+                    .expect("paste fn"),
+            )
             .expect("paste listener");
         closure.forget();
     }
 
-    // global keydown: Ctrl/Cmd+S export
+    // global keydown: Ctrl/Cmd+S export, Ctrl/Cmd+Shift+S copy merged image to clipboard
     {
-        let state = state.clone();
         let closure =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
                 let key = ev.key();
                 if (ev.ctrl_key() || ev.meta_key()) && (key == "s" || key == "S") {
                     ev.prevent_default();
-                    state.with(|s| export_current(s));
+                    if ev.shift_key() {
+                        state.with(copy_current_to_clipboard);
+                    } else {
+                        state.with(export_current);
+                    }
                 }
             });
         window()
-            .add_event_listener_with_callback("keydown", closure.as_ref().dyn_ref::<js_sys::Function>().expect("keydown fn"))
+            .add_event_listener_with_callback(
+                "keydown",
+                closure
+                    .as_ref()
+                    .dyn_ref::<js_sys::Function>()
+                    .expect("keydown fn"),
+            )
             .expect("keydown listener");
         closure.forget();
     }
 
     // file input onchange
     let on_files = {
-        let state = state.clone();
         move |_| {
             let Some(input) = file_ref.get() else { return };
             let Some(files) = input.files() else { return };
@@ -688,7 +842,6 @@ fn App() -> impl IntoView {
         ev.prevent_default();
     };
     let on_drop = {
-        let state = state.clone();
         move |ev: DragEvent| {
             ev.prevent_default();
             let Some(dt) = ev.data_transfer() else { return };
@@ -703,8 +856,6 @@ fn App() -> impl IntoView {
 
     // pointer handlers on canvas
     let on_pointer_move = {
-        let state = state.clone();
-        let canvas_ref = canvas_ref.clone();
         move |ev: PointerEvent| {
             let Some(canvas) = canvas_ref.get() else {
                 return;
@@ -720,17 +871,24 @@ fn App() -> impl IntoView {
                 // update drag
                 if let Some(d) = s.drag.clone() {
                     match d {
-                        DragState::Reorder { id, pointer_dx, .. } => {
-                            // desired center X follows pointer
-                            let center_x = px - pointer_dx;
-                            let insertion = s.compute_insertion_index(id, center_x);
-                            s.drag = Some(DragState::Reorder {
-                                id,
-                                pointer_dx,
-                                insertion_index: insertion,
-                                pointer_x: px,
-                                pointer_y: py,
-                            });
+                        DragState::Move {
+                            id,
+                            pointer_offset_x,
+                            pointer_offset_y,
+                            ..
+                        } => {
+                            if let Some(it) = s.layout.items.iter().find(|x| x.id == id) {
+                                let center_x = (px - pointer_offset_x) + it.w / 2.0;
+                                let insertion = s.compute_insertion_index(id, center_x);
+                                s.drag = Some(DragState::Move {
+                                    id,
+                                    pointer_offset_x,
+                                    pointer_offset_y,
+                                    insertion_index: insertion,
+                                    pointer_x: px,
+                                    pointer_y: py,
+                                });
+                            }
                         }
                         DragState::Resize {
                             id,
@@ -839,31 +997,20 @@ fn App() -> impl IntoView {
     };
 
     let on_pointer_down = {
-        let state = state.clone();
         move |ev: PointerEvent| {
             let px = ev.offset_x() as f64;
             let py = ev.offset_y() as f64;
 
+            if let Some(canvas) = canvas_ref.get() {
+                let _ = canvas.set_pointer_capture(ev.pointer_id());
+            }
+
             state.update(|s| {
                 s.recompute_layout();
 
-                let Some(id) = s.hit_test_item(px, py) else {
-                    s.selected = None;
-                    s.drag = None;
-                    return;
-                };
+                if let Some((id, h)) = s.hit_test_handle_any(px, py) {
+                    s.selected = Some(id);
 
-                // delete click
-                if s.hit_test_delete(id, px, py) {
-                    s.remove_image(id);
-                    return;
-                }
-
-                s.selected = Some(id);
-
-                // resize handle?
-                if let Some(h) = s.hit_test_handle(id, px, py) {
-                    // compute base sizes for this id at current slider
                     let mut h_min = f64::INFINITY;
                     let mut h_max: f64 = 0.0;
                     for img in &s.images {
@@ -876,12 +1023,17 @@ fn App() -> impl IntoView {
                     let ss = s.slider.clamp(0.0, 1.0);
                     let h_target = h_max * (1.0 - ss) + h_min * ss;
 
-                    let img = s.images.iter().find(|i| i.id == id).unwrap();
+                    let img = s.images.iter().find(|i| i.id == id).expect("image exists");
                     let aspect = img.nat_w / img.nat_h;
                     let base_w = h_target * aspect;
                     let base_h = h_target;
 
-                    let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
+                    let it = s
+                        .layout
+                        .items
+                        .iter()
+                        .find(|x| x.id == id)
+                        .expect("layout exists");
 
                     s.drag = Some(DragState::Resize {
                         id,
@@ -901,27 +1053,41 @@ fn App() -> impl IntoView {
                     return;
                 }
 
-                // reorder drag: keep center under pointer with offset
-                let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
-                let center_x = it.x + it.w / 2.0;
-                let pointer_dx = px - center_x;
-                let insertion = s.compute_insertion_index(id, center_x);
-                s.drag = Some(DragState::Reorder {
-                    id,
-                    pointer_dx,
-                    insertion_index: insertion,
-                    pointer_x: px,
-                    pointer_y: py,
-                });
+                let Some(id) = s.hit_test_item(px, py) else {
+                    s.selected = None;
+                    s.drag = None;
+                    return;
+                };
+
+                if s.hit_test_delete(id, px, py) {
+                    s.remove_image(id);
+                    return;
+                }
+
+                s.selected = Some(id);
+
+                if let Some(it) = s.layout.items.iter().find(|x| x.id == id) {
+                    let pointer_offset_x = px - it.x;
+                    let pointer_offset_y = py - it.y;
+                    let center_x = it.x + it.w / 2.0;
+                    let insertion = s.compute_insertion_index(id, center_x);
+                    s.drag = Some(DragState::Move {
+                        id,
+                        pointer_offset_x,
+                        pointer_offset_y,
+                        insertion_index: insertion,
+                        pointer_x: px,
+                        pointer_y: py,
+                    });
+                }
             });
         }
     };
 
     let on_pointer_up = {
-        let state = state.clone();
         move |_ev: PointerEvent| {
             state.update(|s| {
-                if let Some(DragState::Reorder {
+                if let Some(DragState::Move {
                     id,
                     insertion_index,
                     ..
@@ -936,7 +1102,6 @@ fn App() -> impl IntoView {
 
     // controls
     let on_toggle_aspect = {
-        let state = state.clone();
         move |ev| {
             let checked = event_target_checked(&ev);
             state.update(|s| {
@@ -959,7 +1124,6 @@ fn App() -> impl IntoView {
     };
 
     let on_slider = {
-        let state = state.clone();
         move |ev| {
             let v = event_target_value(&ev).parse::<f64>().unwrap_or(0.5);
             state.update(|s| {
@@ -970,7 +1134,6 @@ fn App() -> impl IntoView {
     };
 
     let on_format = {
-        let state = state.clone();
         move |ev| {
             let v = event_target_value(&ev);
             state.update(|s| {
@@ -984,14 +1147,13 @@ fn App() -> impl IntoView {
     };
 
     let on_save_click = {
-        let state = state.clone();
         move |_| {
-            state.with(|s| export_current(s));
+            state.with(export_current);
         }
     };
 
     // Derived strings
-    let warn = create_memo(move |_| state.with(|s| s.layout.warn_too_large));
+    let warn = Memo::new(move |_| state.with(|s| s.layout.warn_too_large));
 
     view! {
         <div class="main" on:dragover=on_drag_over on:drop=on_drop>
@@ -1031,9 +1193,9 @@ fn App() -> impl IntoView {
                     </select>
                 </label>
 
-                <button on:click=on_save_click>"Save (Ctrl+S)"</button>
+                <button on:click=on_save_click>"Save (Ctrl+S, copy: Ctrl+Shift+S)"</button>
 
-                <div class="hint">"Paste images with Ctrl/Cmd+V. Drag to reorder. Handles to resize. Hover × to delete."</div>
+                <div class="hint">"Paste with Ctrl/Cmd+V. Drag from any point inside image to move/swap. Grab corner/edge handles to resize. Hover × to delete."</div>
                 {move || warn.get().then(|| view! { <div class="warn">"Warning: output may exceed typical canvas limits (16384px)."</div> })}
             </div>
 
@@ -1043,6 +1205,7 @@ fn App() -> impl IntoView {
                     on:pointermove=on_pointer_move
                     on:pointerdown=on_pointer_down
                     on:pointerup=on_pointer_up
+                    on:pointercancel=on_pointer_up
                     style="background: rgba(255,255,255,0.02); border: 1px solid rgba(128,128,128,0.35); border-radius: 10px;"
                 ></canvas>
             </div>
