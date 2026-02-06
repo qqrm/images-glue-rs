@@ -43,6 +43,19 @@ enum Handle {
     SW,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StackAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Debug)]
+struct LayoutTransition {
+    from_positions: HashMap<u64, (f64, f64)>,
+    start_ms: f64,
+    duration_ms: f64,
+}
+
 #[derive(Clone, Debug)]
 struct ImageItem {
     id: u64,
@@ -83,12 +96,15 @@ struct AppState {
     keep_aspect: bool,
     slider: f64, // 0..1
     export_format: ExportFormat,
+    axis: StackAxis,
 
     selected: Option<u64>,
     hovered: Option<u64>,
+    proximity_hovered: Option<u64>,
 
     layout: Layout,
     drag: Option<DragState>,
+    transition: Option<LayoutTransition>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +112,10 @@ enum DragState {
     Reorder {
         id: u64,
         pointer_dx: f64, // pointer_x - center_x
+        pointer_dy: f64, // pointer_y - center_y
+        start_pointer_x: f64,
+        start_pointer_y: f64,
+        axis: StackAxis,
         insertion_index: usize,
         pointer_x: f64,
         pointer_y: f64,
@@ -128,10 +148,13 @@ impl Default for AppState {
             keep_aspect: true,
             slider: 0.5,
             export_format: ExportFormat::Jpeg,
+            axis: StackAxis::Horizontal,
             selected: None,
             hovered: None,
+            proximity_hovered: None,
             layout: Layout::default(),
             drag: None,
+            transition: None,
         }
     }
 }
@@ -202,6 +225,8 @@ impl AppState {
 
         // sizes
         let mut x: f64 = 0.0;
+        let mut y: f64 = 0.0;
+        let mut out_w: f64 = 0.0;
         let mut out_h: f64 = 0.0;
         for img in &self.images {
             let aspect = img.nat_w / img.nat_h;
@@ -217,26 +242,41 @@ impl AppState {
                 (base_w * sx, base_h * sy)
             };
 
+            let (item_x, item_y) = match self.axis {
+                StackAxis::Horizontal => (x, 0.0),
+                StackAxis::Vertical => (0.0, y),
+            };
+
             let btn = {
                 let pad = 4.0;
                 let sz = 18.0;
-                (x + w - sz - pad, 0.0 + pad, sz, sz)
+                (item_x + w - sz - pad, item_y + pad, sz, sz)
             };
 
             layout.items.push(LayoutItem {
                 id: img.id,
-                x,
-                y: 0.0,
+                x: item_x,
+                y: item_y,
                 w,
                 h,
                 delete_btn: btn,
             });
 
-            x += w; // gap=0
-            out_h = out_h.max(h);
+            match self.axis {
+                StackAxis::Horizontal => {
+                    x += w; // gap=0
+                    out_w = x;
+                    out_h = out_h.max(h);
+                }
+                StackAxis::Vertical => {
+                    y += h; // gap=0
+                    out_h = y;
+                    out_w = out_w.max(w);
+                }
+            }
         }
 
-        layout.out_w = x;
+        layout.out_w = out_w;
         layout.out_h = out_h;
 
         // Workspace should stay larger than glued content so images can be stretched to the right/bottom.
@@ -260,6 +300,11 @@ impl AppState {
         {
             self.hovered = None;
         }
+        if let Some(id) = self.proximity_hovered
+            && !ids.contains(&id)
+        {
+            self.proximity_hovered = None;
+        }
     }
 
     fn hit_test_item(&self, px: f64, py: f64) -> Option<u64> {
@@ -269,6 +314,35 @@ impl AppState {
             }
         }
         None
+    }
+
+    fn hit_test_item_with_margin(&self, px: f64, py: f64, margin: f64) -> Option<u64> {
+        let mut best: Option<(u64, f64)> = None;
+        for it in &self.layout.items {
+            let dx = if px < it.x {
+                it.x - px
+            } else if px > it.x + it.w {
+                px - (it.x + it.w)
+            } else {
+                0.0
+            };
+            let dy = if py < it.y {
+                it.y - py
+            } else if py > it.y + it.h {
+                py - (it.y + it.h)
+            } else {
+                0.0
+            };
+
+            let dist2 = dx * dx + dy * dy;
+            if dist2 <= margin * margin {
+                match best {
+                    Some((_, best_d2)) if dist2 >= best_d2 => {}
+                    _ => best = Some((it.id, dist2)),
+                }
+            }
+        }
+        best.map(|(id, _)| id)
     }
 
     fn hit_test_delete(&self, id: u64, px: f64, py: f64) -> bool {
@@ -318,6 +392,9 @@ impl AppState {
         if self.hovered == Some(id) {
             self.hovered = None;
         }
+        if self.proximity_hovered == Some(id) {
+            self.proximity_hovered = None;
+        }
         self.drag = None;
         self.recompute_layout();
     }
@@ -326,16 +403,12 @@ impl AppState {
         let idx = self.images.iter().position(|i| i.id == id);
         let Some(from) = idx else { return };
         let item = self.images.remove(from);
-        let mut to = insertion_index.min(self.images.len());
-        if from < to {
-            // after removal, indices shift left
-            to = to.saturating_sub(1);
-        }
+        let to = insertion_index.min(self.images.len());
         self.images.insert(to, item);
         self.recompute_layout();
     }
 
-    fn compute_insertion_index(&self, dragged_id: u64, dragged_center_x: f64) -> usize {
+    fn compute_insertion_index(&self, dragged_id: u64, dragged_center: f64, axis: StackAxis) -> usize {
         // Compare against centers of other items in current packed layout.
         // Insertion index is the count of items whose center is < dragged_center_x.
         let mut centers: Vec<(u64, f64)> = self
@@ -343,13 +416,19 @@ impl AppState {
             .items
             .iter()
             .filter(|it| it.id != dragged_id)
-            .map(|it| (it.id, it.x + it.w / 2.0))
+            .map(|it| {
+                let c = match axis {
+                    StackAxis::Horizontal => it.x + it.w / 2.0,
+                    StackAxis::Vertical => it.y + it.h / 2.0,
+                };
+                (it.id, c)
+            })
             .collect();
         centers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut idx = 0usize;
         for (_, cx) in centers {
-            if dragged_center_x > cx {
+            if dragged_center > cx {
                 idx += 1;
             } else {
                 break;
@@ -357,6 +436,28 @@ impl AppState {
         }
         idx
     }
+}
+
+fn schedule_animation_tick(state: RwSignal<AppState, leptos::prelude::LocalStorage>) {
+    set_timeout(
+        move || {
+            let should_continue = state.with(|s| {
+                if let Some(t) = &s.transition {
+                    js_sys::Date::now() < t.start_ms + t.duration_ms
+                } else {
+                    false
+                }
+            });
+
+            if should_continue {
+                state.update(|_| {});
+                schedule_animation_tick(state);
+            } else {
+                state.update(|s| s.transition = None);
+            }
+        },
+        std::time::Duration::from_millis(16),
+    );
 }
 
 fn is_shortcut_key(ev: &web_sys::KeyboardEvent, code: &str, key_ascii: char) -> bool {
@@ -404,13 +505,14 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
 
     let reorder_preview = if let Some(DragState::Reorder {
         id,
+        axis,
         insertion_index,
         pointer_x,
         pointer_y,
         ..
     }) = &state.drag
     {
-        let mut packed_x = 0.0;
+        let mut packed = 0.0;
         let mut idx = 0usize;
         let mut preview_positions = HashMap::new();
         let dragged_layout = state.layout.items.iter().find(|it| it.id == *id).cloned();
@@ -421,14 +523,20 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
                     continue;
                 }
                 if idx == *insertion_index {
-                    packed_x += dragged_layout.w;
+                    match axis {
+                        StackAxis::Horizontal => packed += dragged_layout.w,
+                        StackAxis::Vertical => packed += dragged_layout.h,
+                    }
                 }
-                preview_positions.insert(it.id, packed_x);
-                packed_x += it.w;
+                preview_positions.insert(it.id, packed);
+                packed += match axis {
+                    StackAxis::Horizontal => it.w,
+                    StackAxis::Vertical => it.h,
+                };
                 idx += 1;
             }
 
-            Some((*id, preview_positions, *pointer_x, *pointer_y, dragged_layout))
+            Some((*id, *axis, preview_positions, *pointer_x, *pointer_y, dragged_layout))
         } else {
             None
         }
@@ -440,22 +548,43 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     for it in &state.layout.items {
         let is_dragged = reorder_preview
             .as_ref()
-            .map(|(dragged_id, _, _, _, _)| *dragged_id == it.id)
+            .map(|(dragged_id, _, _, _, _, _)| *dragged_id == it.id)
             .unwrap_or(false);
 
         if is_dragged {
             continue;
         }
 
-        let draw_x = reorder_preview
-            .as_ref()
-            .and_then(|(_, map, _, _, _)| map.get(&it.id).copied())
-            .unwrap_or(it.x);
+        let draw_pos = if let Some((x, y)) = reorder_preview.as_ref().and_then(|(_, axis, map, _, _, _)| {
+            map.get(&it.id).map(|v| match axis {
+                StackAxis::Horizontal => (*v, it.y),
+                StackAxis::Vertical => (it.x, *v),
+            })
+        }) {
+            (x, y)
+        } else if let Some(t) = &state.transition {
+            let target = (it.x, it.y);
+            let from = t.from_positions.get(&it.id).copied().unwrap_or(target);
+            let p = ((js_sys::Date::now() - t.start_ms) / t.duration_ms).clamp(0.0, 1.0);
+            let e = 1.0 - (1.0 - p).powi(3);
+            (
+                from.0 + (target.0 - from.0) * e,
+                from.1 + (target.1 - from.1) * e,
+            )
+        } else {
+            (it.x, it.y)
+        };
 
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
             // draw the bitmap
             let _ =
-                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, draw_x, it.y, it.w, it.h);
+                ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+                    &img.bitmap,
+                    draw_pos.0,
+                    draw_pos.1,
+                    it.w,
+                    it.h,
+                );
         }
         // outline hover/selected
         let is_sel = state.selected == Some(it.id);
@@ -475,14 +604,15 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             )
             .unwrap();
 
-            ctx.stroke_rect(draw_x + 0.5, it.y + 0.5, it.w - 1.0, it.h - 1.0);
+            ctx.stroke_rect(draw_pos.0 + 0.5, draw_pos.1 + 0.5, it.w - 1.0, it.h - 1.0);
             ctx.restore();
         }
 
         // delete button on hover
         if is_hov {
-            let (_bx, by, bw, bh) = it.delete_btn;
-            let bx = draw_x + it.w - bw - 4.0;
+            let (_bx, _by, bw, bh) = it.delete_btn;
+            let bx = draw_pos.0 + it.w - bw - 4.0;
+            let by = draw_pos.1 + 4.0;
             ctx.save();
 
             Reflect::set(
@@ -517,7 +647,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     }
 
     // draw handles for selected (or hovered if nothing selected)
-    let handle_owner = state.selected.or(state.hovered);
+    let handle_owner = state.selected.or(state.hovered).or(state.proximity_hovered);
     if let Some(id) = handle_owner
         && let Some(it) = state.layout.items.iter().find(|x| x.id == id)
     {
@@ -552,7 +682,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     }
 
     // dragged image preview while reordering
-    if let Some((id, _, pointer_x, pointer_y, it)) = reorder_preview
+    if let Some((id, _, _, pointer_x, pointer_y, it)) = reorder_preview
         && let Some(dragged) = state.images.iter().find(|img| img.id == id)
     {
         let cx = pointer_x - it.w / 2.0;
@@ -870,17 +1000,44 @@ fn App() -> impl IntoView {
             state.update(|s| {
                 // update hover
                 s.hovered = s.hit_test_item(px, py);
+                s.proximity_hovered = if s.hovered.is_none() {
+                    s.hit_test_item_with_margin(px, py, 20.0)
+                } else {
+                    None
+                };
 
                 // update drag
                 if let Some(d) = s.drag.clone() {
                     match d {
-                        DragState::Reorder { id, pointer_dx, .. } => {
-                            // desired center X follows pointer
-                            let center_x = px - pointer_dx;
-                            let insertion = s.compute_insertion_index(id, center_x);
+                        DragState::Reorder {
+                            id,
+                            pointer_dx,
+                            pointer_dy,
+                            start_pointer_x,
+                            start_pointer_y,
+                            axis,
+                            ..
+                        } => {
+                            let switch_threshold = 24.0;
+                            let ax = if (py - start_pointer_y).abs() > (px - start_pointer_x).abs() + switch_threshold {
+                                StackAxis::Vertical
+                            } else if (px - start_pointer_x).abs() > (py - start_pointer_y).abs() + switch_threshold {
+                                StackAxis::Horizontal
+                            } else {
+                                axis
+                            };
+                            let center = match ax {
+                                StackAxis::Horizontal => px - pointer_dx,
+                                StackAxis::Vertical => py - pointer_dy,
+                            };
+                            let insertion = s.compute_insertion_index(id, center, ax);
                             s.drag = Some(DragState::Reorder {
                                 id,
                                 pointer_dx,
+                                pointer_dy,
+                                start_pointer_x,
+                                start_pointer_y,
+                                axis: ax,
                                 insertion_index: insertion,
                                 pointer_x: px,
                                 pointer_y: py,
@@ -1057,11 +1214,17 @@ fn App() -> impl IntoView {
                 // reorder drag: keep center under pointer with offset
                 let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
                 let center_x = it.x + it.w / 2.0;
+                let center_y = it.y + it.h / 2.0;
                 let pointer_dx = px - center_x;
-                let insertion = s.compute_insertion_index(id, center_x);
+                let pointer_dy = py - center_y;
+                let insertion = s.compute_insertion_index(id, center_x, s.axis);
                 s.drag = Some(DragState::Reorder {
                     id,
                     pointer_dx,
+                    pointer_dy,
+                    start_pointer_x: px,
+                    start_pointer_y: py,
+                    axis: s.axis,
                     insertion_index: insertion,
                     pointer_x: px,
                     pointer_y: py,
@@ -1072,17 +1235,35 @@ fn App() -> impl IntoView {
 
     let on_pointer_up = {
         move |_ev: PointerEvent| {
+            let mut started_transition = false;
             state.update(|s| {
                 if let Some(DragState::Reorder {
                     id,
                     insertion_index,
+                    axis,
                     ..
                 }) = s.drag.clone()
                 {
+                    let from_positions = s
+                        .layout
+                        .items
+                        .iter()
+                        .map(|it| (it.id, (it.x, it.y)))
+                        .collect::<HashMap<_, _>>();
+                    s.axis = axis;
                     s.reorder_by_insertion(id, insertion_index);
+                    s.transition = Some(LayoutTransition {
+                        from_positions,
+                        start_ms: js_sys::Date::now(),
+                        duration_ms: 220.0,
+                    });
+                    started_transition = true;
                 }
                 s.drag = None;
             });
+            if started_transition {
+                schedule_animation_tick(state);
+            }
         }
     };
 
@@ -1128,6 +1309,21 @@ fn App() -> impl IntoView {
                 } else {
                     ExportFormat::Jpeg
                 };
+            });
+        }
+    };
+
+
+    let on_axis = {
+        move |ev| {
+            let v = event_target_value(&ev);
+            state.update(|s| {
+                s.axis = if v == "vertical" {
+                    StackAxis::Vertical
+                } else {
+                    StackAxis::Horizontal
+                };
+                s.recompute_layout();
             });
         }
     };
@@ -1184,6 +1380,17 @@ fn App() -> impl IntoView {
                     />
                 </label>
 
+
+                <label style="display:flex;align-items:center;gap:8px;">
+                    <span class="panel-label">"Stack"</span>
+                    <select
+                        prop:value=move || state.with(|s| if s.axis == StackAxis::Vertical { "vertical".to_string() } else { "horizontal".to_string() })
+                        on:change=on_axis
+                    >
+                        <option value="horizontal">"Horizontal"</option>
+                        <option value="vertical">"Vertical"</option>
+                    </select>
+                </label>
                 <label style="display:flex;align-items:center;gap:8px;">
                     <span class="panel-label">"Export"</span>
                     <select
