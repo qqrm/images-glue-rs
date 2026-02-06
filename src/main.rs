@@ -430,9 +430,16 @@ impl AppState {
         let nearest = others[nearest_idx];
         let nearest_cx = nearest.x + nearest.w / 2.0;
         let nearest_cy = nearest.y + nearest.h / 2.0;
-        let place_after = (dragged_center_y > nearest_cy + nearest.h * 0.2)
-            || ((dragged_center_y - nearest_cy).abs() <= nearest.h * 0.2
-                && dragged_center_x > nearest_cx);
+
+        // Allow diagonal/corner snapping as a valid "after" position in addition
+        // to classic right-edge insertion.
+        let is_bottom_right =
+            dragged_center_x >= nearest.x + nearest.w && dragged_center_y >= nearest.y + nearest.h;
+        let is_bottom = dragged_center_y > nearest_cy + nearest.h * 0.2;
+        let is_right = (dragged_center_y - nearest_cy).abs() <= nearest.h * 0.25
+            && dragged_center_x > nearest_cx;
+
+        let place_after = is_bottom_right || is_bottom || is_right;
 
         if place_after {
             nearest_idx + 1
@@ -542,8 +549,13 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
 
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
             // draw the bitmap
-            let _ =
-                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, draw_x, draw_y, it.w, it.h);
+            let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+                &img.bitmap,
+                draw_x,
+                draw_y,
+                it.w,
+                it.h,
+            );
         }
         // outline hover/selected
         let is_sel = state.selected == Some(it.id);
@@ -671,7 +683,6 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.restore();
     }
 }
-
 
 async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<File>) {
     for f in files {
@@ -1264,7 +1275,6 @@ fn App() -> impl IntoView {
         }
     };
 
-
     let on_save_click = {
         move |_| {
             state.with(export_current);
@@ -1346,7 +1356,7 @@ fn App() -> impl IntoView {
                 ></canvas>
                 <div class="floating-hints">
                     <div>"Paste: Ctrl/Cmd+V"</div>
-                    <div>"Reorder: drag image"</div>
+                    <div>"Reorder: drag (including corner snap)"</div>
                     <div>"Resize: drag corner/side handle"</div>
                     <div>"Delete: hover image, click ×"</div>
                     <div>"Copy: Ctrl/Cmd+C"</div>
