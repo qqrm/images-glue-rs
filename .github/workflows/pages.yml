@@ -2,7 +2,7 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 permissions:
@@ -33,7 +33,7 @@ jobs:
         run: cargo install trunk --locked
 
       - name: Build
-        run: trunk build --release
+        run: trunk build --release --public-url ./
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

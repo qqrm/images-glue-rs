@@ -1,4 +1,4 @@
-use leptos::{IntoView, NodeRef, prelude::*};
+use leptos::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -43,7 +43,7 @@ enum Handle {
 #[derive(Clone, Debug)]
 struct ImageItem {
     id: u64,
-    name: String,
+    _name: String,
     bitmap: ImageBitmap,
     nat_w: f64,
     nat_h: f64,
@@ -158,7 +158,7 @@ fn now_ts() -> String {
     // ISO-ish without punctuation for filenames
     let d = js_sys::Date::new_0();
     let y = d.get_full_year();
-    let m = d.get_month() + 1.0;
+    let m = d.get_month() + 1;
     let day = d.get_date();
     let hh = d.get_hours();
     let mm = d.get_minutes();
@@ -180,7 +180,7 @@ impl AppState {
 
         // compute h_min/h_max from natural heights
         let mut h_min = f64::INFINITY;
-        let mut h_max = 0.0;
+        let mut h_max: f64 = 0.0;
         for img in &self.images {
             h_min = h_min.min(img.nat_h);
             h_max = h_max.max(img.nat_h);
@@ -194,8 +194,8 @@ impl AppState {
         let h_target = h_max * (1.0 - s) + h_min * s;
 
         // sizes
-        let mut x = 0.0;
-        let mut out_h = 0.0;
+        let mut x: f64 = 0.0;
+        let mut out_h: f64 = 0.0;
         for img in &self.images {
             let aspect = img.nat_w / img.nat_h;
             let base_w = h_target * aspect;
@@ -455,7 +455,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ..
     }) = &state.drag
     {
-        let mut x = 0.0;
+        let mut x: f64 = 0.0;
         let mut idx = 0usize;
         for it in &state.layout.items {
             if it.id == *id {
@@ -493,10 +493,10 @@ async fn append_files(state: RwSignal<AppState>, files: Vec<File>) {
         let name = f.name();
 
         state.update(|s| {
-            let id = unsafe { js_sys::Math::random().to_bits() };
+            let id = js_sys::Math::random().to_bits();
             s.images.push(ImageItem {
                 id,
-                name,
+                _name: name,
                 bitmap: bmp.clone(),
                 nat_w,
                 nat_h,
@@ -571,7 +571,7 @@ fn export_current(state: &AppState) {
             .unwrap();
         a.set_href(&url);
         a.set_download(&filename);
-        a.set_style("display:none");
+        let _ = a.style().set_property("display", "none");
 
         doc.body().unwrap().append_child(&a).ok();
         a.click();
@@ -580,12 +580,26 @@ fn export_current(state: &AppState) {
         Url::revoke_object_url(&url).ok();
     });
 
-    // to_blob is callback-based
-    let _ = if state.export_format == ExportFormat::Jpeg {
-        canvas.to_blob_with_type_and_quality(cb.as_ref().unchecked_ref(), mime, 0.9)
+    // to_blob is callback-based (JPEG uses explicit quality=0.9 via JS call)
+    if state.export_format == ExportFormat::Jpeg {
+        // web-sys may not expose the quality overload on all versions, so call `canvas.toBlob(cb, mime, quality)` via JS.
+        let to_blob = js_sys::Reflect::get(canvas.as_ref(), &JsValue::from_str("toBlob"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+
+        if let Some(f) = to_blob {
+            let this = JsValue::from(canvas.clone());
+            let args = js_sys::Array::new();
+            args.push(cb.as_ref());
+            args.push(&JsValue::from_str(mime));
+            args.push(&JsValue::from_f64(0.9));
+            let _ = f.apply(&this, &args);
+        } else {
+            let _ = canvas.to_blob_with_type(cb.as_ref().unchecked_ref(), mime);
+        }
     } else {
-        canvas.to_blob_with_type(cb.as_ref().unchecked_ref(), mime)
-    };
+        let _ = canvas.to_blob_with_type(cb.as_ref().unchecked_ref(), mime);
+    }
     cb.forget();
 }
 
@@ -643,13 +657,14 @@ fn App() -> impl IntoView {
     // global keydown: Ctrl/Cmd+S export
     {
         let state = state.clone();
-        let closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev| {
-            let key = ev.key();
-            if (ev.ctrl_key() || ev.meta_key()) && (key == "s" || key == "S") {
-                ev.prevent_default();
-                state.with(|s| export_current(s));
-            }
-        });
+        let closure =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
+                let key = ev.key();
+                if (ev.ctrl_key() || ev.meta_key()) && (key == "s" || key == "S") {
+                    ev.prevent_default();
+                    state.with(|s| export_current(s));
+                }
+            });
         window()
             .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
             .expect("keydown listener");
@@ -856,7 +871,7 @@ fn App() -> impl IntoView {
                 if let Some(h) = s.hit_test_handle(id, px, py) {
                     // compute base sizes for this id at current slider
                     let mut h_min = f64::INFINITY;
-                    let mut h_max = 0.0;
+                    let mut h_max: f64 = 0.0;
                     for img in &s.images {
                         h_min = h_min.min(img.nat_h);
                         h_max = h_max.max(img.nat_h);
@@ -982,7 +997,7 @@ fn App() -> impl IntoView {
     };
 
     // Derived strings
-    let warn = Memo::new(move |_| state.with(|s| s.layout.warn_too_large));
+    let warn = create_memo(move |_| state.with(|s| s.layout.warn_too_large));
 
     view! {
         <div class="main" on:dragover=on_drag_over on:drop=on_drop>
@@ -1006,15 +1021,18 @@ fn App() -> impl IntoView {
                 <label style="display:flex;flex-direction:column;gap:4px;">
                     <span class="panel-label">"Size: largest → smallest"</span>
                     <input type="range" min="0" max="1" step="0.01"
-                        prop:value=move || state.with(|s| s.slider)
+                        prop:value=move || state.with(|s| s.slider.to_string())
                         on:input=on_slider
                     />
                 </label>
 
                 <label style="display:flex;align-items:center;gap:8px;">
                     <span class="panel-label">"Export"</span>
-                    <select on:change=on_format>
-                        <option value="jpg" selected=true>"JPEG"</option>
+                    <select
+                        prop:value=move || state.with(|s| if s.export_format == ExportFormat::Png { "png".to_string() } else { "jpg".to_string() })
+                        on:change=on_format
+                    >
+                        <option value="jpg">"JPEG"</option>
                         <option value="png">"PNG"</option>
                     </select>
                 </label>

@@ -9,10 +9,10 @@ bootstrap:
     cargo install trunk --locked
 
 dev:
-    trunk serve --address 127.0.0.1 --port 8080
+    trunk serve --address 127.0.0.1 --port 8080 --open
 
 build:
-    trunk build --release
+    trunk build --release --public-url ./
 
 fmt:
     cargo fmt --all
