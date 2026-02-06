@@ -2,7 +2,7 @@ https://qqrm.github.io/images-glue-rs
 
 **# images-glue-rs
 
-A tiny browser tool to glue images into a single horizontal strip (row). Paste images from the clipboard,
+A tiny browser tool to glue images into a single tiled canvas. Paste images from the clipboard,
 reorder by dragging, resize with optional aspect ratio lock, then export as JPEG or PNG.
 
 Tech: Rust + WASM + Leptos (CSR) + Canvas2D. Delivery: GitHub Pages.
@@ -38,12 +38,13 @@ just build
 ## Controls
 
 - Add images: file picker (multiple) or paste with Ctrl/Cmd+V
-- Reorder: drag an image; crossing centers swaps order
+- Reorder: drag an image; nearest-tile placement updates order
 - Resize: drag circular handles
   - Keep aspect ratio: checkbox (default ON)
   - When OFF: independent X/Y scaling
 - Delete: hover an image and click the “×” (top-right)
 - Global size normalization: slider (largest ↔ smallest)
+- Layout: automatic tiled wrapping (no horizontal/vertical switch)
 - Export: Ctrl/Cmd+S or click Save
   - JPEG: white background, quality 0.9
   - PNG: transparent background

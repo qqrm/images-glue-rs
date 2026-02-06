@@ -43,12 +43,6 @@ enum Handle {
     SW,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StackAxis {
-    Horizontal,
-    Vertical,
-}
-
 #[derive(Clone, Debug)]
 struct LayoutTransition {
     from_positions: HashMap<u64, (f64, f64)>,
@@ -96,8 +90,6 @@ struct AppState {
     keep_aspect: bool,
     slider: f64, // 0..1
     export_format: ExportFormat,
-    axis: StackAxis,
-
     selected: Option<u64>,
     hovered: Option<u64>,
     proximity_hovered: Option<u64>,
@@ -113,9 +105,6 @@ enum DragState {
         id: u64,
         pointer_dx: f64, // pointer_x - center_x
         pointer_dy: f64, // pointer_y - center_y
-        start_pointer_x: f64,
-        start_pointer_y: f64,
-        axis: StackAxis,
         insertion_index: usize,
         pointer_x: f64,
         pointer_y: f64,
@@ -140,6 +129,8 @@ enum DragState {
 }
 
 const MIN_IMAGE_SIDE_PX: f64 = 48.0;
+const TILE_WRAP_WIDTH_PX: f64 = 1400.0;
+const PREVIEW_PADDING_PX: f64 = 12.0;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -148,7 +139,6 @@ impl Default for AppState {
             keep_aspect: true,
             slider: 0.5,
             export_format: ExportFormat::Jpeg,
-            axis: StackAxis::Horizontal,
             selected: None,
             hovered: None,
             proximity_hovered: None,
@@ -226,6 +216,7 @@ impl AppState {
         // sizes
         let mut x: f64 = 0.0;
         let mut y: f64 = 0.0;
+        let mut row_h: f64 = 0.0;
         let mut out_w: f64 = 0.0;
         let mut out_h: f64 = 0.0;
         for img in &self.images {
@@ -242,10 +233,14 @@ impl AppState {
                 (base_w * sx, base_h * sy)
             };
 
-            let (item_x, item_y) = match self.axis {
-                StackAxis::Horizontal => (x, 0.0),
-                StackAxis::Vertical => (0.0, y),
-            };
+            if x > 0.0 && x + w > TILE_WRAP_WIDTH_PX {
+                x = 0.0;
+                y += row_h;
+                row_h = 0.0;
+            }
+
+            let item_x = x;
+            let item_y = y;
 
             let btn = {
                 let pad = 4.0;
@@ -262,18 +257,10 @@ impl AppState {
                 delete_btn: btn,
             });
 
-            match self.axis {
-                StackAxis::Horizontal => {
-                    x += w; // gap=0
-                    out_w = x;
-                    out_h = out_h.max(h);
-                }
-                StackAxis::Vertical => {
-                    y += h; // gap=0
-                    out_h = y;
-                    out_w = out_w.max(w);
-                }
-            }
+            x += w; // gap=0
+            row_h = row_h.max(h);
+            out_w = out_w.max(x);
+            out_h = y + row_h;
         }
 
         layout.out_w = out_w;
@@ -408,33 +395,50 @@ impl AppState {
         self.recompute_layout();
     }
 
-    fn compute_insertion_index(&self, dragged_id: u64, dragged_center: f64, axis: StackAxis) -> usize {
-        // Compare against centers of other items in current packed layout.
-        // Insertion index is the count of items whose center is < dragged_center_x.
-        let mut centers: Vec<(u64, f64)> = self
+    fn compute_insertion_index(
+        &self,
+        dragged_id: u64,
+        dragged_center_x: f64,
+        dragged_center_y: f64,
+    ) -> usize {
+        let others: Vec<&LayoutItem> = self
             .layout
             .items
             .iter()
             .filter(|it| it.id != dragged_id)
-            .map(|it| {
-                let c = match axis {
-                    StackAxis::Horizontal => it.x + it.w / 2.0,
-                    StackAxis::Vertical => it.y + it.h / 2.0,
-                };
-                (it.id, c)
-            })
             .collect();
-        centers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut idx = 0usize;
-        for (_, cx) in centers {
-            if dragged_center > cx {
-                idx += 1;
-            } else {
-                break;
+        if others.is_empty() {
+            return 0;
+        }
+
+        let mut nearest_idx = 0usize;
+        let mut nearest_dist2 = f64::INFINITY;
+
+        for (idx, it) in others.iter().enumerate() {
+            let cx = it.x + it.w / 2.0;
+            let cy = it.y + it.h / 2.0;
+            let dx = dragged_center_x - cx;
+            let dy = dragged_center_y - cy;
+            let dist2 = dx * dx + dy * dy;
+            if dist2 < nearest_dist2 {
+                nearest_dist2 = dist2;
+                nearest_idx = idx;
             }
         }
-        idx
+
+        let nearest = others[nearest_idx];
+        let nearest_cx = nearest.x + nearest.w / 2.0;
+        let nearest_cy = nearest.y + nearest.h / 2.0;
+        let place_after = (dragged_center_y > nearest_cy + nearest.h * 0.2)
+            || ((dragged_center_y - nearest_cy).abs() <= nearest.h * 0.2
+                && dragged_center_x > nearest_cx);
+
+        if place_after {
+            nearest_idx + 1
+        } else {
+            nearest_idx
+        }
     }
 }
 
@@ -491,9 +495,10 @@ fn set_canvas_size(
 }
 
 fn render(state: &AppState, canvas: &HtmlCanvasElement) {
+    let preview_pad = PREVIEW_PADDING_PX;
     // Preview canvas is intentionally larger than content bounds.
-    let w = state.layout.view_w.max(1.0);
-    let h = state.layout.view_h.max(1.0);
+    let w = (state.layout.view_w + preview_pad * 2.0).max(1.0);
+    let h = (state.layout.view_h + preview_pad * 2.0).max(1.0);
 
     let Some((ctx, _dpr)) = set_canvas_size(canvas, w, h) else {
         return;
@@ -503,66 +508,23 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     // For JPEG export we will draw white, but preview remains neutral.
     ctx.clear_rect(0.0, 0.0, w, h);
 
-    let reorder_preview = if let Some(DragState::Reorder {
-        id,
-        axis,
-        insertion_index,
-        pointer_x,
-        pointer_y,
-        ..
-    }) = &state.drag
-    {
-        let mut packed = 0.0;
-        let mut idx = 0usize;
-        let mut preview_positions = HashMap::new();
-        let dragged_layout = state.layout.items.iter().find(|it| it.id == *id).cloned();
-
-        if let Some(dragged_layout) = dragged_layout {
-            for it in &state.layout.items {
-                if it.id == *id {
-                    continue;
-                }
-                if idx == *insertion_index {
-                    match axis {
-                        StackAxis::Horizontal => packed += dragged_layout.w,
-                        StackAxis::Vertical => packed += dragged_layout.h,
-                    }
-                }
-                preview_positions.insert(it.id, packed);
-                packed += match axis {
-                    StackAxis::Horizontal => it.w,
-                    StackAxis::Vertical => it.h,
-                };
-                idx += 1;
-            }
-
-            Some((*id, *axis, preview_positions, *pointer_x, *pointer_y, dragged_layout))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // draw images
     for it in &state.layout.items {
-        let is_dragged = reorder_preview
+        let is_dragged = state
+            .drag
             .as_ref()
-            .map(|(dragged_id, _, _, _, _, _)| *dragged_id == it.id)
+            .and_then(|drag| match drag {
+                DragState::Reorder { id, .. } => Some(*id),
+                _ => None,
+            })
+            .map(|dragged_id| dragged_id == it.id)
             .unwrap_or(false);
 
         if is_dragged {
             continue;
         }
 
-        let draw_pos = if let Some((x, y)) = reorder_preview.as_ref().and_then(|(_, axis, map, _, _, _)| {
-            map.get(&it.id).map(|v| match axis {
-                StackAxis::Horizontal => (*v, it.y),
-                StackAxis::Vertical => (it.x, *v),
-            })
-        }) {
-            (x, y)
-        } else if let Some(t) = &state.transition {
+        let draw_pos = if let Some(t) = &state.transition {
             let target = (it.x, it.y);
             let from = t.from_positions.get(&it.id).copied().unwrap_or(target);
             let p = ((js_sys::Date::now() - t.start_ms) / t.duration_ms).clamp(0.0, 1.0);
@@ -575,16 +537,13 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             (it.x, it.y)
         };
 
+        let draw_x = draw_pos.0 + preview_pad;
+        let draw_y = draw_pos.1 + preview_pad;
+
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
             // draw the bitmap
             let _ =
-                ctx.draw_image_with_image_bitmap_and_dw_and_dh(
-                    &img.bitmap,
-                    draw_pos.0,
-                    draw_pos.1,
-                    it.w,
-                    it.h,
-                );
+                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, draw_x, draw_y, it.w, it.h);
         }
         // outline hover/selected
         let is_sel = state.selected == Some(it.id);
@@ -604,15 +563,15 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             )
             .unwrap();
 
-            ctx.stroke_rect(draw_pos.0 + 0.5, draw_pos.1 + 0.5, it.w - 1.0, it.h - 1.0);
+            ctx.stroke_rect(draw_x + 0.5, draw_y + 0.5, it.w - 1.0, it.h - 1.0);
             ctx.restore();
         }
 
         // delete button on hover
         if is_hov {
             let (_bx, _by, bw, bh) = it.delete_btn;
-            let bx = draw_pos.0 + it.w - bw - 4.0;
-            let by = draw_pos.1 + 4.0;
+            let bx = draw_x + it.w - bw - 4.0;
+            let by = draw_y + 4.0;
             ctx.save();
 
             Reflect::set(
@@ -672,7 +631,13 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         let r = 5.5;
         for (_h, hx, hy) in AppState::handle_points(it) {
             ctx.begin_path();
-            let _ = ctx.arc(hx, hy, r, 0.0, std::f64::consts::TAU);
+            let _ = ctx.arc(
+                hx + preview_pad,
+                hy + preview_pad,
+                r,
+                0.0,
+                std::f64::consts::TAU,
+            );
             ctx.close_path();
             ctx.fill();
             ctx.stroke();
@@ -682,11 +647,17 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     }
 
     // dragged image preview while reordering
-    if let Some((id, _, _, pointer_x, pointer_y, it)) = reorder_preview
-        && let Some(dragged) = state.images.iter().find(|img| img.id == id)
+    if let Some(DragState::Reorder {
+        id,
+        pointer_x,
+        pointer_y,
+        ..
+    }) = &state.drag
+        && let Some(it) = state.layout.items.iter().find(|it| it.id == *id)
+        && let Some(dragged) = state.images.iter().find(|img| img.id == *id)
     {
-        let cx = pointer_x - it.w / 2.0;
-        let cy = pointer_y - it.h / 2.0;
+        let cx = *pointer_x - it.w / 2.0 + preview_pad;
+        let cy = *pointer_y - it.h / 2.0 + preview_pad;
         ctx.save();
         let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(&dragged.bitmap, cx, cy, it.w, it.h);
         Reflect::set(
@@ -700,6 +671,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.restore();
     }
 }
+
 
 async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<File>) {
     for f in files {
@@ -994,8 +966,8 @@ fn App() -> impl IntoView {
                 return;
             };
             // offsetX/Y in CSS px == logical units (we render in logical units).
-            let px = ev.offset_x() as f64;
-            let py = ev.offset_y() as f64;
+            let px = ev.offset_x() as f64 - PREVIEW_PADDING_PX;
+            let py = ev.offset_y() as f64 - PREVIEW_PADDING_PX;
 
             state.update(|s| {
                 // update hover
@@ -1013,31 +985,15 @@ fn App() -> impl IntoView {
                             id,
                             pointer_dx,
                             pointer_dy,
-                            start_pointer_x,
-                            start_pointer_y,
-                            axis,
                             ..
                         } => {
-                            let switch_threshold = 24.0;
-                            let ax = if (py - start_pointer_y).abs() > (px - start_pointer_x).abs() + switch_threshold {
-                                StackAxis::Vertical
-                            } else if (px - start_pointer_x).abs() > (py - start_pointer_y).abs() + switch_threshold {
-                                StackAxis::Horizontal
-                            } else {
-                                axis
-                            };
-                            let center = match ax {
-                                StackAxis::Horizontal => px - pointer_dx,
-                                StackAxis::Vertical => py - pointer_dy,
-                            };
-                            let insertion = s.compute_insertion_index(id, center, ax);
+                            let center_x = px - pointer_dx;
+                            let center_y = py - pointer_dy;
+                            let insertion = s.compute_insertion_index(id, center_x, center_y);
                             s.drag = Some(DragState::Reorder {
                                 id,
                                 pointer_dx,
                                 pointer_dy,
-                                start_pointer_x,
-                                start_pointer_y,
-                                axis: ax,
                                 insertion_index: insertion,
                                 pointer_x: px,
                                 pointer_y: py,
@@ -1151,8 +1107,8 @@ fn App() -> impl IntoView {
 
     let on_pointer_down = {
         move |ev: PointerEvent| {
-            let px = ev.offset_x() as f64;
-            let py = ev.offset_y() as f64;
+            let px = ev.offset_x() as f64 - PREVIEW_PADDING_PX;
+            let py = ev.offset_y() as f64 - PREVIEW_PADDING_PX;
 
             state.update(|s| {
                 s.recompute_layout();
@@ -1217,14 +1173,11 @@ fn App() -> impl IntoView {
                 let center_y = it.y + it.h / 2.0;
                 let pointer_dx = px - center_x;
                 let pointer_dy = py - center_y;
-                let insertion = s.compute_insertion_index(id, center_x, s.axis);
+                let insertion = s.compute_insertion_index(id, center_x, center_y);
                 s.drag = Some(DragState::Reorder {
                     id,
                     pointer_dx,
                     pointer_dy,
-                    start_pointer_x: px,
-                    start_pointer_y: py,
-                    axis: s.axis,
                     insertion_index: insertion,
                     pointer_x: px,
                     pointer_y: py,
@@ -1240,7 +1193,6 @@ fn App() -> impl IntoView {
                 if let Some(DragState::Reorder {
                     id,
                     insertion_index,
-                    axis,
                     ..
                 }) = s.drag.clone()
                 {
@@ -1250,7 +1202,6 @@ fn App() -> impl IntoView {
                         .iter()
                         .map(|it| (it.id, (it.x, it.y)))
                         .collect::<HashMap<_, _>>();
-                    s.axis = axis;
                     s.reorder_by_insertion(id, insertion_index);
                     s.transition = Some(LayoutTransition {
                         from_positions,
@@ -1314,20 +1265,6 @@ fn App() -> impl IntoView {
     };
 
 
-    let on_axis = {
-        move |ev| {
-            let v = event_target_value(&ev);
-            state.update(|s| {
-                s.axis = if v == "vertical" {
-                    StackAxis::Vertical
-                } else {
-                    StackAxis::Horizontal
-                };
-                s.recompute_layout();
-            });
-        }
-    };
-
     let on_save_click = {
         move |_| {
             state.with(export_current);
@@ -1380,17 +1317,6 @@ fn App() -> impl IntoView {
                     />
                 </label>
 
-
-                <label style="display:flex;align-items:center;gap:8px;">
-                    <span class="panel-label">"Stack"</span>
-                    <select
-                        prop:value=move || state.with(|s| if s.axis == StackAxis::Vertical { "vertical".to_string() } else { "horizontal".to_string() })
-                        on:change=on_axis
-                    >
-                        <option value="horizontal">"Horizontal"</option>
-                        <option value="vertical">"Vertical"</option>
-                    </select>
-                </label>
                 <label style="display:flex;align-items:center;gap:8px;">
                     <span class="panel-label">"Export"</span>
                     <select
