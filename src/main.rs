@@ -11,6 +11,10 @@ const HANDLE_DRAW_RADIUS: f64 = 9.0;
 const HANDLE_HIT_RADIUS: f64 = 14.0;
 const HANDLE_OUTSET: f64 = 8.0;
 const DELETE_BTN_SIZE: f64 = 26.0;
+const PREVIEW_MIN_W: f64 = 1400.0;
+const PREVIEW_MIN_H: f64 = 900.0;
+const PREVIEW_PAD_RIGHT: f64 = 320.0;
+const PREVIEW_PAD_BOTTOM: f64 = 240.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportFormat {
@@ -389,9 +393,7 @@ fn set_canvas_size(
 }
 
 fn render(state: &AppState, canvas: &HtmlCanvasElement) {
-    // Determine logical output size.
-    let w = state.layout.out_w.max(1.0);
-    let h = state.layout.out_h.max(1.0);
+    let (w, h) = preview_size(state);
 
     let Some((ctx, _dpr)) = set_canvas_size(canvas, w, h) else {
         return;
@@ -582,13 +584,31 @@ fn draw_output_to_canvas(
     }
 }
 
-fn export_current(state: &AppState) {
+fn preview_size(state: &AppState) -> (f64, f64) {
+    (
+        (state.layout.out_w + PREVIEW_PAD_RIGHT).max(PREVIEW_MIN_W),
+        (state.layout.out_h + PREVIEW_PAD_BOTTOM).max(PREVIEW_MIN_H),
+    )
+}
+
+fn export_size(state: &AppState, trim_right_bottom: bool) -> (u32, u32) {
+    if trim_right_bottom {
+        (
+            state.layout.out_w.round().max(1.0) as u32,
+            state.layout.out_h.round().max(1.0) as u32,
+        )
+    } else {
+        let (w, h) = preview_size(state);
+        (w.round().max(1.0) as u32, h.round().max(1.0) as u32)
+    }
+}
+
+fn export_current(state: &AppState, trim_right_bottom: bool) {
     if state.images.is_empty() {
         return;
     }
 
-    let out_w = state.layout.out_w.round().max(1.0) as u32;
-    let out_h = state.layout.out_h.round().max(1.0) as u32;
+    let (out_w, out_h) = export_size(state, trim_right_bottom);
 
     let doc = window().document().expect("document");
     let canvas: HtmlCanvasElement = doc
@@ -675,8 +695,7 @@ fn copy_current_to_clipboard(state: &AppState) {
         return;
     }
 
-    let out_w = state.layout.out_w.round().max(1.0) as u32;
-    let out_h = state.layout.out_h.round().max(1.0) as u32;
+    let (out_w, out_h) = export_size(state, true);
 
     let doc = window().document().expect("document");
     let canvas: HtmlCanvasElement = doc
@@ -797,7 +816,7 @@ fn App() -> impl IntoView {
         closure.forget();
     }
 
-    // global keydown: Ctrl/Cmd+S export, Ctrl/Cmd+Shift+S copy merged image to clipboard
+    // global keydown: Ctrl/Cmd+S save full viewport, Ctrl/Cmd+Shift+S save trimmed, Ctrl/Cmd+C copy trimmed merged image
     {
         let closure =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
@@ -805,10 +824,16 @@ fn App() -> impl IntoView {
                 if (ev.ctrl_key() || ev.meta_key()) && (key == "s" || key == "S") {
                     ev.prevent_default();
                     if ev.shift_key() {
-                        state.with(copy_current_to_clipboard);
+                        state.with(|s| export_current(s, true));
                     } else {
-                        state.with(export_current);
+                        state.with(|s| export_current(s, false));
                     }
+                    return;
+                }
+
+                if (ev.ctrl_key() || ev.meta_key()) && (key == "c" || key == "C") {
+                    ev.prevent_default();
+                    state.with(copy_current_to_clipboard);
                 }
             });
         window()
@@ -1148,7 +1173,19 @@ fn App() -> impl IntoView {
 
     let on_save_click = {
         move |_| {
-            state.with(export_current);
+            state.with(|s| export_current(s, false));
+        }
+    };
+
+    let on_trim_save_click = {
+        move |_| {
+            state.with(|s| export_current(s, true));
+        }
+    };
+
+    let on_copy_click = {
+        move |_| {
+            state.with(copy_current_to_clipboard);
         }
     };
 
@@ -1193,7 +1230,9 @@ fn App() -> impl IntoView {
                     </select>
                 </label>
 
-                <button on:click=on_save_click>"Save (Ctrl+S, copy: Ctrl+Shift+S)"</button>
+                <button on:click=on_save_click>"Save full (Ctrl+S)"</button>
+                <button on:click=on_trim_save_click>"Save trimmed (Ctrl+Shift+S)"</button>
+                <button on:click=on_copy_click>"Copy image (Ctrl+C)"</button>
 
                 <div class="hint">"Paste with Ctrl/Cmd+V. Drag from any point inside image to move/swap. Grab corner/edge handles to resize. Hover × to delete."</div>
                 {move || warn.get().then(|| view! { <div class="warn">"Warning: output may exceed typical canvas limits (16384px)."</div> })}

@@ -42,7 +42,10 @@ just build
   - When OFF: independent X/Y scaling
 - Delete: hover an image and click the “×” (top-right)
 - Global size normalization: slider (largest ↔ smallest)
-- Export: Ctrl/Cmd+S or click Save
+- Export:
+  - Save full viewport: Ctrl/Cmd+S
+  - Save trimmed (cuts empty space to the right/bottom): Ctrl/Cmd+Shift+S
+  - Copy trimmed merged image to clipboard: Ctrl/Cmd+C
   - JPEG: white background, quality 0.9
   - PNG: transparent background
 
