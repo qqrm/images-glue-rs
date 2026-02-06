@@ -8,6 +8,8 @@ use web_sys::{
     ImageBitmap, PointerEvent, Url, Window,
 };
 
+use std::collections::HashMap;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportFormat {
     Jpeg,
@@ -400,12 +402,60 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     // For JPEG export we will draw white, but preview remains neutral.
     ctx.clear_rect(0.0, 0.0, w, h);
 
+    let reorder_preview = if let Some(DragState::Reorder {
+        id,
+        insertion_index,
+        pointer_x,
+        pointer_y,
+        ..
+    }) = &state.drag
+    {
+        let mut packed_x = 0.0;
+        let mut idx = 0usize;
+        let mut preview_positions = HashMap::new();
+        let dragged_layout = state.layout.items.iter().find(|it| it.id == *id).cloned();
+
+        if let Some(dragged_layout) = dragged_layout {
+            for it in &state.layout.items {
+                if it.id == *id {
+                    continue;
+                }
+                if idx == *insertion_index {
+                    packed_x += dragged_layout.w;
+                }
+                preview_positions.insert(it.id, packed_x);
+                packed_x += it.w;
+                idx += 1;
+            }
+
+            Some((*id, preview_positions, *pointer_x, *pointer_y, dragged_layout))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // draw images
     for it in &state.layout.items {
+        let is_dragged = reorder_preview
+            .as_ref()
+            .map(|(dragged_id, _, _, _, _)| *dragged_id == it.id)
+            .unwrap_or(false);
+
+        if is_dragged {
+            continue;
+        }
+
+        let draw_x = reorder_preview
+            .as_ref()
+            .and_then(|(_, map, _, _, _)| map.get(&it.id).copied())
+            .unwrap_or(it.x);
+
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
             // draw the bitmap
             let _ =
-                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, it.x, it.y, it.w, it.h);
+                ctx.draw_image_with_image_bitmap_and_dw_and_dh(&img.bitmap, draw_x, it.y, it.w, it.h);
         }
         // outline hover/selected
         let is_sel = state.selected == Some(it.id);
@@ -425,13 +475,14 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             )
             .unwrap();
 
-            ctx.stroke_rect(it.x + 0.5, it.y + 0.5, it.w - 1.0, it.h - 1.0);
+            ctx.stroke_rect(draw_x + 0.5, it.y + 0.5, it.w - 1.0, it.h - 1.0);
             ctx.restore();
         }
 
         // delete button on hover
         if is_hov {
-            let (bx, by, bw, bh) = it.delete_btn;
+            let (_bx, by, bw, bh) = it.delete_btn;
+            let bx = draw_x + it.w - bw - 4.0;
             ctx.save();
 
             Reflect::set(
@@ -500,80 +551,22 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.restore();
     }
 
-    // insertion marker while reordering
-    if let Some(DragState::Reorder {
-        id,
-        insertion_index,
-        pointer_x,
-        pointer_y,
-        ..
-    }) = &state.drag
+    // dragged image preview while reordering
+    if let Some((id, _, pointer_x, pointer_y, it)) = reorder_preview
+        && let Some(dragged) = state.images.iter().find(|img| img.id == id)
     {
-        if let Some(it) = state.layout.items.iter().find(|x| x.id == *id)
-            && let Some(dragged) = state.images.iter().find(|img| img.id == *id)
-        {
-            let cx = *pointer_x - it.w / 2.0;
-            let cy = *pointer_y - it.h / 2.0;
-            ctx.save();
-            Reflect::set(
-                ctx.as_ref(),
-                &JsValue::from_str("globalAlpha"),
-                &JsValue::from_f64(0.65),
-            )
-            .unwrap();
-            let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(
-                &dragged.bitmap,
-                cx,
-                cy,
-                it.w,
-                it.h,
-            );
-            ctx.restore();
-
-            ctx.save();
-            Reflect::set(
-                ctx.as_ref(),
-                &JsValue::from_str("strokeStyle"),
-                &JsValue::from_str("rgba(255,255,255,0.75)"),
-            )
-            .unwrap();
-            ctx.set_line_width(1.0);
-            ctx.stroke_rect(cx + 0.5, cy + 0.5, it.w - 1.0, it.h - 1.0);
-            ctx.begin_path();
-            ctx.move_to(*pointer_x - 6.0, *pointer_y);
-            ctx.line_to(*pointer_x + 6.0, *pointer_y);
-            ctx.move_to(*pointer_x, *pointer_y - 6.0);
-            ctx.line_to(*pointer_x, *pointer_y + 6.0);
-            ctx.stroke();
-            ctx.restore();
-        }
-
-        let mut x: f64 = 0.0;
-        let mut idx = 0usize;
-        for it in &state.layout.items {
-            if it.id == *id {
-                continue;
-            }
-            if idx == *insertion_index {
-                break;
-            }
-            x = it.x + it.w;
-            idx += 1;
-        }
+        let cx = pointer_x - it.w / 2.0;
+        let cy = pointer_y - it.h / 2.0;
         ctx.save();
-
+        let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(&dragged.bitmap, cx, cy, it.w, it.h);
         Reflect::set(
             ctx.as_ref(),
             &JsValue::from_str("strokeStyle"),
             &JsValue::from_str("rgba(255,255,255,0.9)"),
         )
         .unwrap();
-
-        ctx.set_line_width(2.0);
-        ctx.begin_path();
-        ctx.move_to(x + 0.5, 0.0);
-        ctx.line_to(x + 0.5, h);
-        ctx.stroke();
+        ctx.set_line_width(1.5);
+        ctx.stroke_rect(cx + 0.5, cy + 0.5, it.w - 1.0, it.h - 1.0);
         ctx.restore();
     }
 }
@@ -754,6 +747,7 @@ fn App() -> impl IntoView {
     let file_ref = NodeRef::<leptos::html::Input>::new();
 
     let state = RwSignal::new_local(AppState::default());
+    let copy_feedback = RwSignal::new_local(false);
 
     // render effect
     Effect::new({
@@ -812,6 +806,11 @@ fn App() -> impl IntoView {
                     } else if is_shortcut_key(&ev, "KeyC", 'c') {
                         ev.prevent_default();
                         state.with(copy_current_to_clipboard);
+                        copy_feedback.set(true);
+                        set_timeout(
+                            move || copy_feedback.set(false),
+                            std::time::Duration::from_millis(700),
+                        );
                     }
                 }
             });
@@ -1142,6 +1141,11 @@ fn App() -> impl IntoView {
     let on_copy_click = {
         move |_| {
             state.with(copy_current_to_clipboard);
+            copy_feedback.set(true);
+            set_timeout(
+                move || copy_feedback.set(false),
+                std::time::Duration::from_millis(700),
+            );
         }
     };
 
@@ -1151,12 +1155,17 @@ fn App() -> impl IntoView {
     view! {
         <div class="main" on:dragover=on_drag_over on:drop=on_drop>
             <div class="topbar">
-                <label>
-                    <span class="panel-label">"Add"</span>
+                <label class="file-picker">
+                    <span class="file-picker-label">"Add images"</span>
                     <input node_ref=file_ref type="file" accept="image/*" multiple
                         on:change=on_files
-                        style="margin-left:8px;"
                     />
+                    <span class="file-picker-status">
+                        {move || {
+                            let count = state.with(|s| s.images.len());
+                            if count == 0 { "No images".to_string() } else { format!("{} image(s)", count) }
+                        }}
+                    </span>
                 </label>
 
                 <label style="display:flex;align-items:center;gap:8px;">
@@ -1186,10 +1195,11 @@ fn App() -> impl IntoView {
                     </select>
                 </label>
 
-                <button on:click=on_save_click>"Save (Ctrl+S / Ctrl+Shift+S)"</button>
-                <button on:click=on_copy_click>"Copy image (Ctrl+C)"</button>
+                <button on:click=on_save_click>"Save"</button>
+                <button class=move || if copy_feedback.get() { "copy-btn copy-btn-ok" } else { "copy-btn" } on:click=on_copy_click>
+                    {move || if copy_feedback.get() { "Copied" } else { "Copy" }}
+                </button>
 
-                <div class="hint">"Paste with Ctrl/Cmd+V. Drag to reorder. Use corner handles to stretch right/down. Hover × to delete."</div>
                 {move || warn.get().then(|| view! { <div class="warn">"Warning: output may exceed typical canvas limits (16384px)."</div> })}
             </div>
 
@@ -1201,6 +1211,14 @@ fn App() -> impl IntoView {
                     on:pointerup=on_pointer_up
                     style="background: rgba(255,255,255,0.02); border: 1px solid rgba(128,128,128,0.35); border-radius: 10px;"
                 ></canvas>
+                <div class="floating-hints">
+                    <div>"Paste: Ctrl/Cmd+V"</div>
+                    <div>"Reorder: drag image"</div>
+                    <div>"Resize: drag corner/side handle"</div>
+                    <div>"Delete: hover image, click ×"</div>
+                    <div>"Copy: Ctrl/Cmd+C"</div>
+                    <div>"Save: Ctrl/Cmd+S"</div>
+                </div>
             </div>
         </div>
     }
