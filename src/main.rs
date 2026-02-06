@@ -4,7 +4,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, ClipboardEvent, DragEvent, File, FileList, HtmlAnchorElement, HtmlCanvasElement,
-    HtmlInputElement, ImageBitmap, PointerEvent, Url, Window,
+    ImageBitmap, PointerEvent, Url, Window,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,12 +355,10 @@ fn set_canvas_size(
 ) -> Option<(web_sys::CanvasRenderingContext2d, f64)> {
     let dpr = window().device_pixel_ratio();
     canvas
-        .style()
-        .set_property("width", &format!("{}px", css_w.max(1.0)))
-        .ok()?;
-    canvas
-        .style()
-        .set_property("height", &format!("{}px", css_h.max(1.0)))
+        .set_attribute(
+            "style",
+            &format!("width:{}px;height:{}px;", css_w.max(1.0), css_h.max(1.0)),
+        )
         .ok()?;
 
     canvas.set_width((css_w.max(1.0) * dpr).round() as u32);
@@ -478,7 +476,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     }
 }
 
-async fn append_files(state: RwSignal<AppState>, files: Vec<File>) {
+async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<File>) {
     for f in files {
         let mime = f.type_();
         if !mime.starts_with("image/") {
@@ -571,7 +569,7 @@ fn export_current(state: &AppState) {
             .unwrap();
         a.set_href(&url);
         a.set_download(&filename);
-        let _ = a.style().set_property("display", "none");
+        let _ = a.set_attribute("style", "display:none;");
 
         doc.body().unwrap().append_child(&a).ok();
         a.click();
@@ -608,7 +606,7 @@ fn App() -> impl IntoView {
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
     let file_ref = NodeRef::<leptos::html::Input>::new();
 
-    let state: RwSignal<AppState> = create_rw_signal(AppState::default());
+    let state = RwSignal::new_local(AppState::default());
 
     // render effect
     create_effect({
@@ -616,7 +614,6 @@ fn App() -> impl IntoView {
         move |_| {
             state.with(|s| {
                 if let Some(canvas) = canvas_ref.get() {
-                    let canvas: HtmlCanvasElement = canvas.into_any().dyn_into().expect("canvas");
                     render(s, &canvas);
                 }
             });
@@ -637,7 +634,7 @@ fn App() -> impl IntoView {
                     if !mime.starts_with("image/") {
                         continue;
                     }
-                    if let Some(file) = it.get_as_file() {
+                    if let Ok(Some(file)) = it.get_as_file() {
                         let state2 = state.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             append_files(state2, vec![file]).await;
@@ -676,7 +673,6 @@ fn App() -> impl IntoView {
         let state = state.clone();
         move |_| {
             let Some(input) = file_ref.get() else { return };
-            let input: HtmlInputElement = input.into_any().dyn_into().expect("file input");
             let Some(files) = input.files() else { return };
             let files = file_list_to_vec(&files);
             // reset input so selecting same file again triggers change
@@ -713,8 +709,6 @@ fn App() -> impl IntoView {
             let Some(canvas) = canvas_ref.get() else {
                 return;
             };
-            let canvas: HtmlCanvasElement = canvas.into_any().dyn_into().expect("canvas");
-
             // offsetX/Y in CSS px == logical units (we render in logical units).
             let px = ev.offset_x() as f64;
             let py = ev.offset_y() as f64;
@@ -1040,7 +1034,7 @@ fn App() -> impl IntoView {
                 <button on:click=on_save_click>"Save (Ctrl+S)"</button>
 
                 <div class="hint">"Paste images with Ctrl/Cmd+V. Drag to reorder. Handles to resize. Hover × to delete."</div>
-                {move || if warn.get() { view!{ <div class="warn">"Warning: output may exceed typical canvas limits (16384px)."</div> }.into_view() } else { ().into_view() }}
+                {move || warn.get().then(|| view! { <div class="warn">"Warning: output may exceed typical canvas limits (16384px)."</div> })}
             </div>
 
             <div class="canvas-wrap">
