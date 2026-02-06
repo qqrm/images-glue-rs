@@ -8,6 +8,8 @@ use web_sys::{
     ImageBitmap, PointerEvent, Url, Window,
 };
 
+use std::collections::HashMap;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportFormat {
     Jpeg,
@@ -42,6 +44,13 @@ enum Handle {
 }
 
 #[derive(Clone, Debug)]
+struct LayoutTransition {
+    from_positions: HashMap<u64, (f64, f64)>,
+    start_ms: f64,
+    duration_ms: f64,
+}
+
+#[derive(Clone, Debug)]
 struct ImageItem {
     id: u64,
     _name: String,
@@ -53,8 +62,6 @@ struct ImageItem {
     k: f64,  // used when keep_aspect = true
     sx: f64, // used when keep_aspect = false
     sy: f64, // used when keep_aspect = false
-    tx: f64,
-    ty: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -89,16 +96,18 @@ struct AppState {
 
     layout: Layout,
     drag: Option<DragState>,
+    transition: Option<LayoutTransition>,
 }
 
 #[derive(Clone, Debug)]
 enum DragState {
-    Move {
+    Reorder {
         id: u64,
-        start_pointer_x: f64,
-        start_pointer_y: f64,
-        start_tx: f64,
-        start_ty: f64,
+        pointer_dx: f64, // pointer_x - center_x
+        pointer_dy: f64, // pointer_y - center_y
+        insertion_index: usize,
+        pointer_x: f64,
+        pointer_y: f64,
     },
     Resize {
         id: u64,
@@ -120,6 +129,7 @@ enum DragState {
 }
 
 const MIN_IMAGE_SIDE_PX: f64 = 48.0;
+const TILE_WRAP_WIDTH_PX: f64 = 1400.0;
 const PREVIEW_PADDING_PX: f64 = 12.0;
 
 impl Default for AppState {
@@ -134,6 +144,7 @@ impl Default for AppState {
             proximity_hovered: None,
             layout: Layout::default(),
             drag: None,
+            transition: None,
         }
     }
 }
@@ -202,6 +213,10 @@ impl AppState {
         let s = self.slider.clamp(0.0, 1.0);
         let h_target = h_max * (1.0 - s) + h_min * s;
 
+        // sizes
+        let mut x: f64 = 0.0;
+        let mut y: f64 = 0.0;
+        let mut row_h: f64 = 0.0;
         let mut out_w: f64 = 0.0;
         let mut out_h: f64 = 0.0;
         for img in &self.images {
@@ -218,8 +233,14 @@ impl AppState {
                 (base_w * sx, base_h * sy)
             };
 
-            let item_x = img.tx;
-            let item_y = img.ty;
+            if x > 0.0 && x + w > TILE_WRAP_WIDTH_PX {
+                x = 0.0;
+                y += row_h;
+                row_h = 0.0;
+            }
+
+            let item_x = x;
+            let item_y = y;
 
             let btn = {
                 let pad = 4.0;
@@ -236,8 +257,10 @@ impl AppState {
                 delete_btn: btn,
             });
 
-            out_w = out_w.max(item_x + w);
-            out_h = out_h.max(item_y + h);
+            x += w; // gap=0
+            row_h = row_h.max(h);
+            out_w = out_w.max(x);
+            out_h = y + row_h;
         }
 
         layout.out_w = out_w;
@@ -362,6 +385,90 @@ impl AppState {
         self.drag = None;
         self.recompute_layout();
     }
+
+    fn reorder_by_insertion(&mut self, id: u64, insertion_index: usize) {
+        let idx = self.images.iter().position(|i| i.id == id);
+        let Some(from) = idx else { return };
+        let item = self.images.remove(from);
+        let to = insertion_index.min(self.images.len());
+        self.images.insert(to, item);
+        self.recompute_layout();
+    }
+
+    fn compute_insertion_index(
+        &self,
+        dragged_id: u64,
+        dragged_center_x: f64,
+        dragged_center_y: f64,
+    ) -> usize {
+        let others: Vec<&LayoutItem> = self
+            .layout
+            .items
+            .iter()
+            .filter(|it| it.id != dragged_id)
+            .collect();
+
+        if others.is_empty() {
+            return 0;
+        }
+
+        let mut nearest_idx = 0usize;
+        let mut nearest_dist2 = f64::INFINITY;
+
+        for (idx, it) in others.iter().enumerate() {
+            let cx = it.x + it.w / 2.0;
+            let cy = it.y + it.h / 2.0;
+            let dx = dragged_center_x - cx;
+            let dy = dragged_center_y - cy;
+            let dist2 = dx * dx + dy * dy;
+            if dist2 < nearest_dist2 {
+                nearest_dist2 = dist2;
+                nearest_idx = idx;
+            }
+        }
+
+        let nearest = others[nearest_idx];
+        let nearest_cx = nearest.x + nearest.w / 2.0;
+        let nearest_cy = nearest.y + nearest.h / 2.0;
+
+        // Allow diagonal/corner snapping as a valid "after" position in addition
+        // to classic right-edge insertion.
+        let is_bottom_right =
+            dragged_center_x >= nearest.x + nearest.w && dragged_center_y >= nearest.y + nearest.h;
+        let is_bottom = dragged_center_y > nearest_cy + nearest.h * 0.2;
+        let is_right = (dragged_center_y - nearest_cy).abs() <= nearest.h * 0.25
+            && dragged_center_x > nearest_cx;
+
+        let place_after = is_bottom_right || is_bottom || is_right;
+
+        if place_after {
+            nearest_idx + 1
+        } else {
+            nearest_idx
+        }
+    }
+}
+
+fn schedule_animation_tick(state: RwSignal<AppState, leptos::prelude::LocalStorage>) {
+    set_timeout(
+        move || {
+            let should_continue = state.with(|s| {
+                if let Some(t) = &s.transition {
+                    js_sys::Date::now() < t.start_ms + t.duration_ms
+                } else {
+                    false
+                }
+            });
+
+            if should_continue {
+                state.update(|_| {});
+                schedule_animation_tick(state);
+            } else {
+                state.update(|s| s.transition = None);
+            }
+        },
+        std::time::Duration::from_millis(16),
+    );
 }
 
 fn is_shortcut_key(ev: &web_sys::KeyboardEvent, code: &str, key_ascii: char) -> bool {
@@ -414,7 +521,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             .drag
             .as_ref()
             .and_then(|drag| match drag {
-                DragState::Move { id, .. } => Some(*id),
+                DragState::Reorder { id, .. } => Some(*id),
                 _ => None,
             })
             .map(|dragged_id| dragged_id == it.id)
@@ -423,8 +530,22 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         if is_dragged {
             continue;
         }
-        let draw_x = it.x + preview_pad;
-        let draw_y = it.y + preview_pad;
+
+        let draw_pos = if let Some(t) = &state.transition {
+            let target = (it.x, it.y);
+            let from = t.from_positions.get(&it.id).copied().unwrap_or(target);
+            let p = ((js_sys::Date::now() - t.start_ms) / t.duration_ms).clamp(0.0, 1.0);
+            let e = 1.0 - (1.0 - p).powi(3);
+            (
+                from.0 + (target.0 - from.0) * e,
+                from.1 + (target.1 - from.1) * e,
+            )
+        } else {
+            (it.x, it.y)
+        };
+
+        let draw_x = draw_pos.0 + preview_pad;
+        let draw_y = draw_pos.1 + preview_pad;
 
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
             // draw the bitmap
@@ -536,6 +657,31 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
 
         ctx.restore();
     }
+
+    // dragged image preview while reordering
+    if let Some(DragState::Reorder {
+        id,
+        pointer_x,
+        pointer_y,
+        ..
+    }) = &state.drag
+        && let Some(it) = state.layout.items.iter().find(|it| it.id == *id)
+        && let Some(dragged) = state.images.iter().find(|img| img.id == *id)
+    {
+        let cx = *pointer_x - it.w / 2.0 + preview_pad;
+        let cy = *pointer_y - it.h / 2.0 + preview_pad;
+        ctx.save();
+        let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(&dragged.bitmap, cx, cy, it.w, it.h);
+        Reflect::set(
+            ctx.as_ref(),
+            &JsValue::from_str("strokeStyle"),
+            &JsValue::from_str("rgba(255,255,255,0.9)"),
+        )
+        .unwrap();
+        ctx.set_line_width(1.5);
+        ctx.stroke_rect(cx + 0.5, cy + 0.5, it.w - 1.0, it.h - 1.0);
+        ctx.restore();
+    }
 }
 
 async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<File>) {
@@ -563,8 +709,6 @@ async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<Fi
                 k: 1.0,
                 sx: 1.0,
                 sy: 1.0,
-                tx: s.layout.out_w,
-                ty: 0.0,
             });
             s.selected = Some(id);
             s.recompute_layout();
@@ -848,24 +992,22 @@ fn App() -> impl IntoView {
                 // update drag
                 if let Some(d) = s.drag.clone() {
                     match d {
-                        DragState::Move {
+                        DragState::Reorder {
                             id,
-                            start_pointer_x,
-                            start_pointer_y,
-                            start_tx,
-                            start_ty,
+                            pointer_dx,
+                            pointer_dy,
+                            ..
                         } => {
-                            if let Some(img) = s.images.iter_mut().find(|i| i.id == id) {
-                                img.tx = start_tx + (px - start_pointer_x);
-                                img.ty = start_ty + (py - start_pointer_y);
-                            }
-                            s.recompute_layout();
-                            s.drag = Some(DragState::Move {
+                            let center_x = px - pointer_dx;
+                            let center_y = py - pointer_dy;
+                            let insertion = s.compute_insertion_index(id, center_x, center_y);
+                            s.drag = Some(DragState::Reorder {
                                 id,
-                                start_pointer_x,
-                                start_pointer_y,
-                                start_tx,
-                                start_ty,
+                                pointer_dx,
+                                pointer_dy,
+                                insertion_index: insertion,
+                                pointer_x: px,
+                                pointer_y: py,
                             });
                         }
                         DragState::Resize {
@@ -1036,24 +1178,54 @@ fn App() -> impl IntoView {
                     return;
                 }
 
-                if let Some(img) = s.images.iter().find(|i| i.id == id) {
-                    s.drag = Some(DragState::Move {
-                        id,
-                        start_pointer_x: px,
-                        start_pointer_y: py,
-                        start_tx: img.tx,
-                        start_ty: img.ty,
-                    });
-                }
+                // reorder drag: keep center under pointer with offset
+                let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
+                let center_x = it.x + it.w / 2.0;
+                let center_y = it.y + it.h / 2.0;
+                let pointer_dx = px - center_x;
+                let pointer_dy = py - center_y;
+                let insertion = s.compute_insertion_index(id, center_x, center_y);
+                s.drag = Some(DragState::Reorder {
+                    id,
+                    pointer_dx,
+                    pointer_dy,
+                    insertion_index: insertion,
+                    pointer_x: px,
+                    pointer_y: py,
+                });
             });
         }
     };
 
     let on_pointer_up = {
         move |_ev: PointerEvent| {
+            let mut started_transition = false;
             state.update(|s| {
+                if let Some(DragState::Reorder {
+                    id,
+                    insertion_index,
+                    ..
+                }) = s.drag.clone()
+                {
+                    let from_positions = s
+                        .layout
+                        .items
+                        .iter()
+                        .map(|it| (it.id, (it.x, it.y)))
+                        .collect::<HashMap<_, _>>();
+                    s.reorder_by_insertion(id, insertion_index);
+                    s.transition = Some(LayoutTransition {
+                        from_positions,
+                        start_ms: js_sys::Date::now(),
+                        duration_ms: 220.0,
+                    });
+                    started_transition = true;
+                }
                 s.drag = None;
             });
+            if started_transition {
+                schedule_animation_tick(state);
+            }
         }
     };
 
@@ -1184,7 +1356,7 @@ fn App() -> impl IntoView {
                 ></canvas>
                 <div class="floating-hints">
                     <div>"Paste: Ctrl/Cmd+V"</div>
-                    <div>"Move: drag image freely"</div>
+                    <div>"Reorder: drag (including corner snap)"</div>
                     <div>"Resize: drag corner/side handle"</div>
                     <div>"Delete: hover image, click ×"</div>
                     <div>"Copy: Ctrl/Cmd+C"</div>
