@@ -95,8 +95,8 @@ enum DragState {
         id: u64,
         pointer_dx: f64, // pointer_x - center_x
         insertion_index: usize,
-        _pointer_x: f64,
-        _pointer_y: f64,
+        pointer_x: f64,
+        pointer_y: f64,
     },
     Resize {
         id: u64,
@@ -116,6 +116,8 @@ enum DragState {
         start_h: f64,
     },
 }
+
+const MIN_IMAGE_SIDE_PX: f64 = 48.0;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -355,6 +357,10 @@ impl AppState {
     }
 }
 
+fn is_shortcut_key(ev: &web_sys::KeyboardEvent, code: &str, key_ascii: char) -> bool {
+    ev.code() == code || ev.key().eq_ignore_ascii_case(&key_ascii.to_string())
+}
+
 fn set_canvas_size(
     canvas: &HtmlCanvasElement,
     css_w: f64,
@@ -498,9 +504,50 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     if let Some(DragState::Reorder {
         id,
         insertion_index,
+        pointer_x,
+        pointer_y,
         ..
     }) = &state.drag
     {
+        if let Some(it) = state.layout.items.iter().find(|x| x.id == *id)
+            && let Some(dragged) = state.images.iter().find(|img| img.id == *id)
+        {
+            let cx = *pointer_x - it.w / 2.0;
+            let cy = *pointer_y - it.h / 2.0;
+            ctx.save();
+            Reflect::set(
+                ctx.as_ref(),
+                &JsValue::from_str("globalAlpha"),
+                &JsValue::from_f64(0.65),
+            )
+            .unwrap();
+            let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(
+                &dragged.bitmap,
+                cx,
+                cy,
+                it.w,
+                it.h,
+            );
+            ctx.restore();
+
+            ctx.save();
+            Reflect::set(
+                ctx.as_ref(),
+                &JsValue::from_str("strokeStyle"),
+                &JsValue::from_str("rgba(255,255,255,0.75)"),
+            )
+            .unwrap();
+            ctx.set_line_width(1.0);
+            ctx.stroke_rect(cx + 0.5, cy + 0.5, it.w - 1.0, it.h - 1.0);
+            ctx.begin_path();
+            ctx.move_to(*pointer_x - 6.0, *pointer_y);
+            ctx.line_to(*pointer_x + 6.0, *pointer_y);
+            ctx.move_to(*pointer_x, *pointer_y - 6.0);
+            ctx.line_to(*pointer_x, *pointer_y + 6.0);
+            ctx.stroke();
+            ctx.restore();
+        }
+
         let mut x: f64 = 0.0;
         let mut idx = 0usize;
         for it in &state.layout.items {
@@ -758,12 +805,11 @@ fn App() -> impl IntoView {
     {
         let closure =
             Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
-                let key = ev.key();
                 if ev.ctrl_key() || ev.meta_key() {
-                    if key == "s" || key == "S" {
+                    if is_shortcut_key(&ev, "KeyS", 's') {
                         ev.prevent_default();
                         state.with(export_current);
-                    } else if key == "c" || key == "C" {
+                    } else if is_shortcut_key(&ev, "KeyC", 'c') {
                         ev.prevent_default();
                         state.with(copy_current_to_clipboard);
                     }
@@ -837,8 +883,8 @@ fn App() -> impl IntoView {
                                 id,
                                 pointer_dx,
                                 insertion_index: insertion,
-                                _pointer_x: px,
-                                _pointer_y: py,
+                                pointer_x: px,
+                                pointer_y: py,
                             });
                         }
                         DragState::Resize {
@@ -865,25 +911,25 @@ fn App() -> impl IntoView {
                             let mut target_h = start_h;
 
                             match handle {
-                                Handle::E => target_w = (start_w + dx).max(10.0),
-                                Handle::W => target_w = (start_w - dx).max(10.0),
-                                Handle::S => target_h = (start_h + dy).max(10.0),
-                                Handle::N => target_h = (start_h - dy).max(10.0),
+                                Handle::E => target_w = (start_w + dx).max(MIN_IMAGE_SIDE_PX),
+                                Handle::W => target_w = (start_w - dx).max(MIN_IMAGE_SIDE_PX),
+                                Handle::S => target_h = (start_h + dy).max(MIN_IMAGE_SIDE_PX),
+                                Handle::N => target_h = (start_h - dy).max(MIN_IMAGE_SIDE_PX),
                                 Handle::SE => {
-                                    target_w = (start_w + dx).max(10.0);
-                                    target_h = (start_h + dy).max(10.0);
+                                    target_w = (start_w + dx).max(MIN_IMAGE_SIDE_PX);
+                                    target_h = (start_h + dy).max(MIN_IMAGE_SIDE_PX);
                                 }
                                 Handle::SW => {
-                                    target_w = (start_w - dx).max(10.0);
-                                    target_h = (start_h + dy).max(10.0);
+                                    target_w = (start_w - dx).max(MIN_IMAGE_SIDE_PX);
+                                    target_h = (start_h + dy).max(MIN_IMAGE_SIDE_PX);
                                 }
                                 Handle::NE => {
-                                    target_w = (start_w + dx).max(10.0);
-                                    target_h = (start_h - dy).max(10.0);
+                                    target_w = (start_w + dx).max(MIN_IMAGE_SIDE_PX);
+                                    target_h = (start_h - dy).max(MIN_IMAGE_SIDE_PX);
                                 }
                                 Handle::NW => {
-                                    target_w = (start_w - dx).max(10.0);
-                                    target_h = (start_h - dy).max(10.0);
+                                    target_w = (start_w - dx).max(MIN_IMAGE_SIDE_PX);
+                                    target_h = (start_h - dy).max(MIN_IMAGE_SIDE_PX);
                                 }
                             }
 
@@ -1018,8 +1064,8 @@ fn App() -> impl IntoView {
                     id,
                     pointer_dx,
                     insertion_index: insertion,
-                    _pointer_x: px,
-                    _pointer_y: py,
+                    pointer_x: px,
+                    pointer_y: py,
                 });
             });
         }
