@@ -1,21 +1,27 @@
+# Works on Windows (PowerShell). Requires:
+# - rustup target add wasm32-unknown-unknown
+# - trunk (cargo install trunk)
+
 set shell := ["pwsh", "-NoLogo", "-NoProfile", "-Command"]
 
-# Show available recipes (use: just --list)
-default:
-    just --list
+# Default action: show available commands
+default: help
 
-bootstrap:
-    rustup target add wasm32-unknown-unknown
-    cargo install trunk --locked
+help:
+    @just --list
 
+# Start dev server (http://127.0.0.1:8080)
 dev:
-    trunk serve --address 127.0.0.1 --port 8080 --open
+    trunk serve --open
 
+# Clean build artifacts
+clean:
+    cargo clean
+
+# Build a release bundle into dist/
 build:
-    trunk build --release --public-url ./
+    trunk build --release
 
-fmt:
-    cargo fmt --all
-
-clippy:
-    cargo clippy --all-targets --all-features -- -D warnings
+# Local Pages preview (serves dist/)
+serve-dist:
+    trunk serve --dist dist --open

@@ -1,4 +1,4 @@
-use leptos::*;
+use leptos::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -595,10 +595,10 @@ fn export_current(state: &AppState) {
             args.push(&JsValue::from_f64(0.9));
             let _ = f.apply(&this, &args);
         } else {
-            let _ = canvas.to_blob_with_type(cb.as_ref().unchecked_ref(), mime);
+            let _ = canvas.to_blob_with_type(cb.as_ref().dyn_ref::<js_sys::Function>().expect("toBlob cb"), mime);
         }
     } else {
-        let _ = canvas.to_blob_with_type(cb.as_ref().unchecked_ref(), mime);
+        let _ = canvas.to_blob_with_type(cb.as_ref().dyn_ref::<js_sys::Function>().expect("toBlob cb"), mime);
     }
     cb.forget();
 }
@@ -616,7 +616,7 @@ fn App() -> impl IntoView {
         move |_| {
             state.with(|s| {
                 if let Some(canvas) = canvas_ref.get() {
-                    let canvas: HtmlCanvasElement = canvas.into_any().unchecked_into();
+                    let canvas: HtmlCanvasElement = canvas.into_any().dyn_into().expect("canvas");
                     render(s, &canvas);
                 }
             });
@@ -649,7 +649,7 @@ fn App() -> impl IntoView {
             }
         });
         window()
-            .add_event_listener_with_callback("paste", closure.as_ref().unchecked_ref())
+            .add_event_listener_with_callback("paste", closure.as_ref().dyn_ref::<js_sys::Function>().expect("paste fn"))
             .expect("paste listener");
         closure.forget();
     }
@@ -666,7 +666,7 @@ fn App() -> impl IntoView {
                 }
             });
         window()
-            .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+            .add_event_listener_with_callback("keydown", closure.as_ref().dyn_ref::<js_sys::Function>().expect("keydown fn"))
             .expect("keydown listener");
         closure.forget();
     }
@@ -676,7 +676,7 @@ fn App() -> impl IntoView {
         let state = state.clone();
         move |_| {
             let Some(input) = file_ref.get() else { return };
-            let input: HtmlInputElement = input.into_any().unchecked_into();
+            let input: HtmlInputElement = input.into_any().dyn_into().expect("file input");
             let Some(files) = input.files() else { return };
             let files = file_list_to_vec(&files);
             // reset input so selecting same file again triggers change
@@ -713,7 +713,7 @@ fn App() -> impl IntoView {
             let Some(canvas) = canvas_ref.get() else {
                 return;
             };
-            let canvas: HtmlCanvasElement = canvas.into_any().unchecked_into();
+            let canvas: HtmlCanvasElement = canvas.into_any().dyn_into().expect("canvas");
 
             // offsetX/Y in CSS px == logical units (we render in logical units).
             let px = ev.offset_x() as f64;
