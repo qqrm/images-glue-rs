@@ -62,6 +62,24 @@ struct ImageItem {
     k: f64,  // used when keep_aspect = true
     sx: f64, // used when keep_aspect = false
     sy: f64, // used when keep_aspect = false
+    line_break_before: bool,
+    row_indent: f64,
+    row_offset: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapMode {
+    Inline,
+    Bottom,
+    BottomRight,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SnapDecision {
+    insertion_index: usize,
+    mode: SnapMode,
+    target_id: Option<u64>,
+    row_indent: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +126,8 @@ enum DragState {
         insertion_index: usize,
         pointer_x: f64,
         pointer_y: f64,
+        snap_mode: SnapMode,
+        snap_target_id: Option<u64>,
     },
     Resize {
         id: u64,
@@ -233,6 +253,12 @@ impl AppState {
                 (base_w * sx, base_h * sy)
             };
 
+            if img.line_break_before {
+                x = img.row_indent.max(0.0);
+                y += row_h;
+                row_h = 0.0;
+            }
+
             if x > 0.0 && x + w > TILE_WRAP_WIDTH_PX {
                 x = 0.0;
                 y += row_h;
@@ -240,7 +266,7 @@ impl AppState {
             }
 
             let item_x = x;
-            let item_y = y;
+            let item_y = y + img.row_offset;
 
             let btn = {
                 let pad = 4.0;
@@ -258,9 +284,9 @@ impl AppState {
             });
 
             x += w; // gap=0
-            row_h = row_h.max(h);
+            row_h = row_h.max(h + img.row_offset.max(0.0));
             out_w = out_w.max(x);
-            out_h = y + row_h;
+            out_h = out_h.max(item_y + h);
         }
 
         layout.out_w = out_w;
@@ -386,12 +412,26 @@ impl AppState {
         self.recompute_layout();
     }
 
-    fn reorder_by_insertion(&mut self, id: u64, insertion_index: usize) {
+    fn reorder_by_insertion(&mut self, id: u64, snap: SnapDecision) {
         let idx = self.images.iter().position(|i| i.id == id);
         let Some(from) = idx else { return };
         let item = self.images.remove(from);
-        let to = insertion_index.min(self.images.len());
+        let to = snap.insertion_index.min(self.images.len());
         self.images.insert(to, item);
+
+        if let Some(inserted) = self.images.get_mut(to) {
+            inserted.line_break_before = false;
+            inserted.row_indent = 0.0;
+            inserted.row_offset = 0.0;
+
+            match snap.mode {
+                SnapMode::Inline => {}
+                SnapMode::Bottom | SnapMode::BottomRight => {
+                    inserted.line_break_before = snap.target_id.is_some();
+                    inserted.row_indent = snap.row_indent.max(0.0);
+                }
+            }
+        }
         self.recompute_layout();
     }
 
@@ -400,7 +440,7 @@ impl AppState {
         dragged_id: u64,
         dragged_center_x: f64,
         dragged_center_y: f64,
-    ) -> usize {
+    ) -> SnapDecision {
         let others: Vec<&LayoutItem> = self
             .layout
             .items
@@ -409,7 +449,12 @@ impl AppState {
             .collect();
 
         if others.is_empty() {
-            return 0;
+            return SnapDecision {
+                insertion_index: 0,
+                mode: SnapMode::Inline,
+                target_id: None,
+                row_indent: 0.0,
+            };
         }
 
         let mut nearest_idx = 0usize;
@@ -439,12 +484,34 @@ impl AppState {
         let is_right = (dragged_center_y - nearest_cy).abs() <= nearest.h * 0.25
             && dragged_center_x > nearest_cx;
 
-        let place_after = is_bottom_right || is_bottom || is_right;
-
-        if place_after {
-            nearest_idx + 1
+        if is_bottom_right {
+            SnapDecision {
+                insertion_index: nearest_idx + 1,
+                mode: SnapMode::BottomRight,
+                target_id: Some(nearest.id),
+                row_indent: nearest.x + nearest.w,
+            }
+        } else if is_bottom {
+            SnapDecision {
+                insertion_index: nearest_idx + 1,
+                mode: SnapMode::Bottom,
+                target_id: Some(nearest.id),
+                row_indent: nearest.x,
+            }
+        } else if is_right {
+            SnapDecision {
+                insertion_index: nearest_idx + 1,
+                mode: SnapMode::Inline,
+                target_id: Some(nearest.id),
+                row_indent: 0.0,
+            }
         } else {
-            nearest_idx
+            SnapDecision {
+                insertion_index: nearest_idx,
+                mode: SnapMode::Inline,
+                target_id: Some(nearest.id),
+                row_indent: 0.0,
+            }
         }
     }
 }
@@ -709,6 +776,9 @@ async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<Fi
                 k: 1.0,
                 sx: 1.0,
                 sy: 1.0,
+                line_break_before: false,
+                row_indent: 0.0,
+                row_offset: 0.0,
             });
             s.selected = Some(id);
             s.recompute_layout();
@@ -1000,14 +1070,16 @@ fn App() -> impl IntoView {
                         } => {
                             let center_x = px - pointer_dx;
                             let center_y = py - pointer_dy;
-                            let insertion = s.compute_insertion_index(id, center_x, center_y);
+                            let snap = s.compute_insertion_index(id, center_x, center_y);
                             s.drag = Some(DragState::Reorder {
                                 id,
                                 pointer_dx,
                                 pointer_dy,
-                                insertion_index: insertion,
+                                insertion_index: snap.insertion_index,
                                 pointer_x: px,
                                 pointer_y: py,
+                                snap_mode: snap.mode,
+                                snap_target_id: snap.target_id,
                             });
                         }
                         DragState::Resize {
@@ -1189,9 +1261,11 @@ fn App() -> impl IntoView {
                     id,
                     pointer_dx,
                     pointer_dy,
-                    insertion_index: insertion,
+                    insertion_index: insertion.insertion_index,
                     pointer_x: px,
                     pointer_y: py,
+                    snap_mode: insertion.mode,
+                    snap_target_id: insertion.target_id,
                 });
             });
         }
@@ -1204,6 +1278,8 @@ fn App() -> impl IntoView {
                 if let Some(DragState::Reorder {
                     id,
                     insertion_index,
+                    snap_mode,
+                    snap_target_id,
                     ..
                 }) = s.drag.clone()
                 {
@@ -1213,7 +1289,38 @@ fn App() -> impl IntoView {
                         .iter()
                         .map(|it| (it.id, (it.x, it.y)))
                         .collect::<HashMap<_, _>>();
-                    s.reorder_by_insertion(id, insertion_index);
+                    let snap = s.compute_insertion_index(
+                        id,
+                        s.drag
+                            .as_ref()
+                            .and_then(|d| match d {
+                                DragState::Reorder {
+                                    pointer_dx,
+                                    pointer_x,
+                                    ..
+                                } => Some(pointer_x - pointer_dx),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0),
+                        s.drag
+                            .as_ref()
+                            .and_then(|d| match d {
+                                DragState::Reorder {
+                                    pointer_dy,
+                                    pointer_y,
+                                    ..
+                                } => Some(pointer_y - pointer_dy),
+                                _ => None,
+                            })
+                            .unwrap_or(0.0),
+                    );
+                    let final_snap = SnapDecision {
+                        insertion_index,
+                        mode: snap_mode,
+                        target_id: snap_target_id,
+                        row_indent: snap.row_indent,
+                    };
+                    s.reorder_by_insertion(id, final_snap);
                     s.transition = Some(LayoutTransition {
                         from_positions,
                         start_ms: js_sys::Date::now(),
