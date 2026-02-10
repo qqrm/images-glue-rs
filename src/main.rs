@@ -62,9 +62,10 @@ struct ImageItem {
     k: f64,  // used when keep_aspect = true
     sx: f64, // used when keep_aspect = false
     sy: f64, // used when keep_aspect = false
-    line_break_before: bool,
-    row_indent: f64,
-    row_offset: f64,
+
+    // workspace position (top-left) in logical CSS px
+    x: f64,
+    y: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,20 @@ enum SnapMode {
     Bottom,
     BottomRight,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapKind {
+    None,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 
 #[derive(Clone, Copy, Debug)]
 struct SnapDecision {
@@ -119,15 +134,16 @@ struct AppState {
 
 #[derive(Clone, Debug)]
 enum DragState {
-    Reorder {
+    Move {
         id: u64,
-        pointer_dx: f64, // pointer_x - center_x
-        pointer_dy: f64, // pointer_y - center_y
-        insertion_index: usize,
+        grab_dx: f64, // pointer_x - item_x at drag start
+        grab_dy: f64, // pointer_y - item_y at drag start
         pointer_x: f64,
         pointer_y: f64,
-        snap_mode: SnapMode,
+        draw_x: f64,
+        draw_y: f64,
         snap_target_id: Option<u64>,
+        snap_kind: SnapKind,
     },
     Resize {
         id: u64,
@@ -151,6 +167,9 @@ enum DragState {
 const MIN_IMAGE_SIDE_PX: f64 = 48.0;
 const TILE_WRAP_WIDTH_PX: f64 = 1400.0;
 const PREVIEW_PADDING_PX: f64 = 12.0;
+const SNAP_DIST_PX: f64 = 14.0;
+const SNAP_CORNER_DIST_PX: f64 = 18.0;
+const SNAP_AXIS_GAP_PX: f64 = 64.0;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -211,114 +230,306 @@ fn now_ts() -> String {
 
 impl AppState {
     fn recompute_layout(&mut self) {
-        let mut layout = Layout::default();
+    let mut layout = Layout::default();
 
-        if self.images.is_empty() {
-            self.layout = layout;
-            return;
-        }
-
-        // compute h_min/h_max from natural heights
-        let mut h_min = f64::INFINITY;
-        let mut h_max: f64 = 0.0;
-        for img in &self.images {
-            h_min = h_min.min(img.nat_h);
-            h_max = h_max.max(img.nat_h);
-        }
-        if !h_min.is_finite() {
-            h_min = 1.0;
-        }
-
-        // slider S: 0 -> max, 1 -> min
-        let s = self.slider.clamp(0.0, 1.0);
-        let h_target = h_max * (1.0 - s) + h_min * s;
-
-        // sizes
-        let mut x: f64 = 0.0;
-        let mut y: f64 = 0.0;
-        let mut row_h: f64 = 0.0;
-        let mut out_w: f64 = 0.0;
-        let mut out_h: f64 = 0.0;
-        for img in &self.images {
-            let aspect = img.nat_w / img.nat_h;
-            let base_w = h_target * aspect;
-            let base_h = h_target;
-
-            let (w, h) = if self.keep_aspect {
-                let k = img.k.max(0.01);
-                (base_w * k, base_h * k)
-            } else {
-                let sx = img.sx.max(0.01);
-                let sy = img.sy.max(0.01);
-                (base_w * sx, base_h * sy)
-            };
-
-            if img.line_break_before {
-                x = img.row_indent.max(0.0);
-                y += row_h;
-                row_h = 0.0;
-            }
-
-            if x > 0.0 && x + w > TILE_WRAP_WIDTH_PX {
-                x = 0.0;
-                y += row_h;
-                row_h = 0.0;
-            }
-
-            let item_x = x;
-            let item_y = y + img.row_offset;
-
-            let btn = {
-                let pad = 4.0;
-                let sz = 18.0;
-                (item_x + w - sz - pad, item_y + pad, sz, sz)
-            };
-
-            layout.items.push(LayoutItem {
-                id: img.id,
-                x: item_x,
-                y: item_y,
-                w,
-                h,
-                delete_btn: btn,
-            });
-
-            x += w; // gap=0
-            row_h = row_h.max(h + img.row_offset.max(0.0));
-            out_w = out_w.max(x);
-            out_h = out_h.max(item_y + h);
-        }
-
-        layout.out_w = out_w;
-        layout.out_h = out_h;
-
-        // Workspace should stay larger than glued content so images can be stretched to the right/bottom.
-        layout.view_w = (layout.out_w + 1200.0).max(1600.0);
-        layout.view_h = (layout.out_h + 900.0).max(900.0);
-
-        // warning: typical max canvas dimension (varies by browser/GPU)
-        layout.warn_too_large = layout.out_w > 16384.0 || layout.out_h > 16384.0;
-
+    if self.images.is_empty() {
         self.layout = layout;
+        return;
+    }
 
-        // clamp hovered/selected if items removed
-        let ids: std::collections::HashSet<u64> = self.images.iter().map(|i| i.id).collect();
-        if let Some(id) = self.selected
-            && !ids.contains(&id)
-        {
-            self.selected = None;
+    // compute h_min/h_max from natural heights
+    let mut h_min = f64::INFINITY;
+    let mut h_max: f64 = 0.0;
+    for img in &self.images {
+        h_min = h_min.min(img.nat_h);
+        h_max = h_max.max(img.nat_h);
+    }
+    if !h_min.is_finite() {
+        h_min = 1.0;
+    }
+
+    // slider S: 0 -> max, 1 -> min
+    let s = self.slider.clamp(0.0, 1.0);
+    let h_target = h_max * (1.0 - s) + h_min * s;
+
+    // sanitize/normalize positions: keep everything in non-negative space
+    for img in &mut self.images {
+        if !img.x.is_finite() {
+            img.x = 0.0;
         }
-        if let Some(id) = self.hovered
-            && !ids.contains(&id)
-        {
-            self.hovered = None;
-        }
-        if let Some(id) = self.proximity_hovered
-            && !ids.contains(&id)
-        {
-            self.proximity_hovered = None;
+        if !img.y.is_finite() {
+            img.y = 0.0;
         }
     }
+    let min_x = self
+        .images
+        .iter()
+        .map(|i| i.x)
+        .fold(f64::INFINITY, f64::min);
+    let min_y = self
+        .images
+        .iter()
+        .map(|i| i.y)
+        .fold(f64::INFINITY, f64::min);
+
+    let shift_x = if min_x < 0.0 { -min_x } else { 0.0 };
+    let shift_y = if min_y < 0.0 { -min_y } else { 0.0 };
+    if shift_x != 0.0 || shift_y != 0.0 {
+        for img in &mut self.images {
+            img.x += shift_x;
+            img.y += shift_y;
+        }
+    }
+
+    // build layout from explicit positions (free 2D placement)
+    let mut out_w: f64 = 0.0;
+    let mut out_h: f64 = 0.0;
+
+    for img in &self.images {
+        let aspect = img.nat_w / img.nat_h;
+        let base_w = h_target * aspect;
+        let base_h = h_target;
+
+        let (w, h) = if self.keep_aspect {
+            let k = img.k.max(0.01);
+            (base_w * k, base_h * k)
+        } else {
+            let sx = img.sx.max(0.01);
+            let sy = img.sy.max(0.01);
+            (base_w * sx, base_h * sy)
+        };
+
+        let item_x = img.x;
+        let item_y = img.y;
+
+        let btn = {
+            let pad = 4.0;
+            let sz = 18.0;
+            (item_x + w - sz - pad, item_y + pad, sz, sz)
+        };
+
+        layout.items.push(LayoutItem {
+            id: img.id,
+            x: item_x,
+            y: item_y,
+            w,
+            h,
+            delete_btn: btn,
+        });
+
+        out_w = out_w.max(item_x + w);
+        out_h = out_h.max(item_y + h);
+    }
+
+    layout.out_w = out_w;
+    layout.out_h = out_h;
+
+    // Workspace should stay larger than glued content so images can be stretched to the right/bottom.
+    layout.view_w = (layout.out_w + 1200.0).max(1600.0);
+    layout.view_h = (layout.out_h + 900.0).max(900.0);
+
+    // warning: typical max canvas dimension (varies by browser/GPU)
+    layout.warn_too_large = layout.out_w > 16384.0 || layout.out_h > 16384.0;
+
+    self.layout = layout;
+
+    // clamp hovered/selected if items removed
+    let ids: std::collections::HashSet<u64> = self.images.iter().map(|i| i.id).collect();
+    if let Some(id) = self.selected && !ids.contains(&id) {
+        self.selected = None;
+    }
+    if let Some(id) = self.hovered && !ids.contains(&id) {
+        self.hovered = None;
+    }
+    if let Some(id) = self.proximity_hovered && !ids.contains(&id) {
+        self.proximity_hovered = None;
+    }
+}
+
+
+
+fn compute_snapped_position(
+    &self,
+    dragged_id: u64,
+    desired_x: f64,
+    desired_y: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64, Option<u64>, SnapKind) {
+    fn range_gap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+        if a1 < b0 {
+            b0 - a1
+        } else if b1 < a0 {
+            a0 - b1
+        } else {
+            0.0
+        }
+    }
+
+    let mut best_x = desired_x;
+    let mut best_y = desired_y;
+    let mut best_id: Option<u64> = None;
+    let mut best_kind = SnapKind::None;
+    let mut best_cost = SNAP_DIST_PX + 1.0;
+
+    for it in &self.layout.items {
+        if it.id == dragged_id {
+            continue;
+        }
+
+        let it_l = it.x;
+        let it_r = it.x + it.w;
+        let it_t = it.y;
+        let it_b = it.y + it.h;
+
+        let consider = |cand_x: f64,
+                        cand_y: f64,
+                        kind: SnapKind,
+                        threshold: f64,
+                        best_x: &mut f64,
+                        best_y: &mut f64,
+                        best_id: &mut Option<u64>,
+                        best_kind: &mut SnapKind,
+                        best_cost: &mut f64| {
+            let dx = cand_x - desired_x;
+            let dy = cand_y - desired_y;
+            let cost = (dx * dx + dy * dy).sqrt();
+            if cost <= threshold && cost < *best_cost {
+                *best_cost = cost;
+                *best_x = cand_x;
+                *best_y = cand_y;
+                *best_id = Some(it.id);
+                *best_kind = kind;
+            }
+        };
+
+        // Edge snaps (attach by a side).
+        // right: dragged.left -> it.right
+        {
+            let cand_x = it_r;
+            let cand_y = desired_y;
+            let v_gap = range_gap(cand_y, cand_y + h, it_t, it_b);
+            if v_gap <= SNAP_AXIS_GAP_PX {
+                consider(
+                    cand_x,
+                    cand_y,
+                    SnapKind::Right,
+                    SNAP_DIST_PX,
+                    &mut best_x,
+                    &mut best_y,
+                    &mut best_id,
+                    &mut best_kind,
+                    &mut best_cost,
+                );
+            }
+        }
+        // left: dragged.right -> it.left
+        {
+            let cand_x = it_l - w;
+            let cand_y = desired_y;
+            let v_gap = range_gap(cand_y, cand_y + h, it_t, it_b);
+            if v_gap <= SNAP_AXIS_GAP_PX {
+                consider(
+                    cand_x,
+                    cand_y,
+                    SnapKind::Left,
+                    SNAP_DIST_PX,
+                    &mut best_x,
+                    &mut best_y,
+                    &mut best_id,
+                    &mut best_kind,
+                    &mut best_cost,
+                );
+            }
+        }
+        // bottom: dragged.top -> it.bottom
+        {
+            let cand_x = desired_x;
+            let cand_y = it_b;
+            let h_gap = range_gap(cand_x, cand_x + w, it_l, it_r);
+            if h_gap <= SNAP_AXIS_GAP_PX {
+                consider(
+                    cand_x,
+                    cand_y,
+                    SnapKind::Bottom,
+                    SNAP_DIST_PX,
+                    &mut best_x,
+                    &mut best_y,
+                    &mut best_id,
+                    &mut best_kind,
+                    &mut best_cost,
+                );
+            }
+        }
+        // top: dragged.bottom -> it.top
+        {
+            let cand_x = desired_x;
+            let cand_y = it_t - h;
+            let h_gap = range_gap(cand_x, cand_x + w, it_l, it_r);
+            if h_gap <= SNAP_AXIS_GAP_PX {
+                consider(
+                    cand_x,
+                    cand_y,
+                    SnapKind::Top,
+                    SNAP_DIST_PX,
+                    &mut best_x,
+                    &mut best_y,
+                    &mut best_id,
+                    &mut best_kind,
+                    &mut best_cost,
+                );
+            }
+        }
+
+        // Corner snaps (attach by a corner).
+        consider(
+            it_r,
+            it_b,
+            SnapKind::BottomRight,
+            SNAP_CORNER_DIST_PX,
+            &mut best_x,
+            &mut best_y,
+            &mut best_id,
+            &mut best_kind,
+            &mut best_cost,
+        );
+        consider(
+            it_l - w,
+            it_b,
+            SnapKind::BottomLeft,
+            SNAP_CORNER_DIST_PX,
+            &mut best_x,
+            &mut best_y,
+            &mut best_id,
+            &mut best_kind,
+            &mut best_cost,
+        );
+        consider(
+            it_r,
+            it_t - h,
+            SnapKind::TopRight,
+            SNAP_CORNER_DIST_PX,
+            &mut best_x,
+            &mut best_y,
+            &mut best_id,
+            &mut best_kind,
+            &mut best_cost,
+        );
+        consider(
+            it_l - w,
+            it_t - h,
+            SnapKind::TopLeft,
+            SNAP_CORNER_DIST_PX,
+            &mut best_x,
+            &mut best_y,
+            &mut best_id,
+            &mut best_kind,
+            &mut best_cost,
+        );
+    }
+
+    (best_x, best_y, best_id, best_kind)
+}
 
     fn hit_test_item(&self, px: f64, py: f64) -> Option<u64> {
         for it in &self.layout.items {
@@ -411,109 +622,6 @@ impl AppState {
         self.drag = None;
         self.recompute_layout();
     }
-
-    fn reorder_by_insertion(&mut self, id: u64, snap: SnapDecision) {
-        let idx = self.images.iter().position(|i| i.id == id);
-        let Some(from) = idx else { return };
-        let item = self.images.remove(from);
-        let to = snap.insertion_index.min(self.images.len());
-        self.images.insert(to, item);
-
-        if let Some(inserted) = self.images.get_mut(to) {
-            inserted.line_break_before = false;
-            inserted.row_indent = 0.0;
-            inserted.row_offset = 0.0;
-
-            match snap.mode {
-                SnapMode::Inline => {}
-                SnapMode::Bottom | SnapMode::BottomRight => {
-                    inserted.line_break_before = snap.target_id.is_some();
-                    inserted.row_indent = snap.row_indent.max(0.0);
-                }
-            }
-        }
-        self.recompute_layout();
-    }
-
-    fn compute_insertion_index(
-        &self,
-        dragged_id: u64,
-        dragged_center_x: f64,
-        dragged_center_y: f64,
-    ) -> SnapDecision {
-        let others: Vec<&LayoutItem> = self
-            .layout
-            .items
-            .iter()
-            .filter(|it| it.id != dragged_id)
-            .collect();
-
-        if others.is_empty() {
-            return SnapDecision {
-                insertion_index: 0,
-                mode: SnapMode::Inline,
-                target_id: None,
-                row_indent: 0.0,
-            };
-        }
-
-        let mut nearest_idx = 0usize;
-        let mut nearest_dist2 = f64::INFINITY;
-
-        for (idx, it) in others.iter().enumerate() {
-            let cx = it.x + it.w / 2.0;
-            let cy = it.y + it.h / 2.0;
-            let dx = dragged_center_x - cx;
-            let dy = dragged_center_y - cy;
-            let dist2 = dx * dx + dy * dy;
-            if dist2 < nearest_dist2 {
-                nearest_dist2 = dist2;
-                nearest_idx = idx;
-            }
-        }
-
-        let nearest = others[nearest_idx];
-        let nearest_cx = nearest.x + nearest.w / 2.0;
-        let nearest_cy = nearest.y + nearest.h / 2.0;
-
-        // Allow diagonal/corner snapping as a valid "after" position in addition
-        // to classic right-edge insertion.
-        let is_bottom_right =
-            dragged_center_x >= nearest.x + nearest.w && dragged_center_y >= nearest.y + nearest.h;
-        let is_bottom = dragged_center_y > nearest_cy + nearest.h * 0.2;
-        let is_right = (dragged_center_y - nearest_cy).abs() <= nearest.h * 0.25
-            && dragged_center_x > nearest_cx;
-
-        if is_bottom_right {
-            SnapDecision {
-                insertion_index: nearest_idx + 1,
-                mode: SnapMode::BottomRight,
-                target_id: Some(nearest.id),
-                row_indent: nearest.x + nearest.w,
-            }
-        } else if is_bottom {
-            SnapDecision {
-                insertion_index: nearest_idx + 1,
-                mode: SnapMode::Bottom,
-                target_id: Some(nearest.id),
-                row_indent: nearest.x,
-            }
-        } else if is_right {
-            SnapDecision {
-                insertion_index: nearest_idx + 1,
-                mode: SnapMode::Inline,
-                target_id: Some(nearest.id),
-                row_indent: 0.0,
-            }
-        } else {
-            SnapDecision {
-                insertion_index: nearest_idx,
-                mode: SnapMode::Inline,
-                target_id: Some(nearest.id),
-                row_indent: 0.0,
-            }
-        }
-    }
 }
 
 fn schedule_animation_tick(state: RwSignal<AppState, leptos::prelude::LocalStorage>) {
@@ -588,7 +696,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             .drag
             .as_ref()
             .and_then(|drag| match drag {
-                DragState::Reorder { id, .. } => Some(*id),
+                DragState::Move { id, .. } => Some(*id),
                 _ => None,
             })
             .map(|dragged_id| dragged_id == it.id)
@@ -685,7 +793,16 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     }
 
     // draw handles for selected (or hovered if nothing selected)
-    let handle_owner = state.selected.or(state.hovered).or(state.proximity_hovered);
+    // Hide while moving an image to avoid handle artifacts at the old position.
+    let dragging_move_id = state.drag.as_ref().and_then(|d| match d {
+        DragState::Move { id, .. } => Some(*id),
+        _ => None,
+    });
+    let handle_owner = if dragging_move_id.is_some() {
+        None
+    } else {
+        state.selected.or(state.hovered).or(state.proximity_hovered)
+    };
     if let Some(id) = handle_owner
         && let Some(it) = state.layout.items.iter().find(|x| x.id == id)
     {
@@ -725,18 +842,18 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.restore();
     }
 
-    // dragged image preview while reordering
-    if let Some(DragState::Reorder {
+        // dragged image preview while moving
+    if let Some(DragState::Move {
         id,
-        pointer_x,
-        pointer_y,
+        draw_x,
+        draw_y,
         ..
     }) = &state.drag
         && let Some(it) = state.layout.items.iter().find(|it| it.id == *id)
         && let Some(dragged) = state.images.iter().find(|img| img.id == *id)
     {
-        let cx = *pointer_x - it.w / 2.0 + preview_pad;
-        let cy = *pointer_y - it.h / 2.0 + preview_pad;
+        let cx = *draw_x + preview_pad;
+        let cy = *draw_y + preview_pad;
         ctx.save();
         let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(&dragged.bitmap, cx, cy, it.w, it.h);
         Reflect::set(
@@ -750,6 +867,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.restore();
     }
 }
+
 
 async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<File>) {
     for f in files {
@@ -776,9 +894,8 @@ async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<Fi
                 k: 1.0,
                 sx: 1.0,
                 sy: 1.0,
-                line_break_before: false,
-                row_indent: 0.0,
-                row_offset: 0.0,
+                x: 0.0,
+                y: s.layout.out_h,
             });
             s.selected = Some(id);
             s.recompute_layout();
@@ -1062,24 +1179,38 @@ fn App() -> impl IntoView {
                 // update drag
                 if let Some(d) = s.drag.clone() {
                     match d {
-                        DragState::Reorder {
+                                                DragState::Move {
                             id,
-                            pointer_dx,
-                            pointer_dy,
+                            grab_dx,
+                            grab_dy,
                             ..
                         } => {
-                            let center_x = px - pointer_dx;
-                            let center_y = py - pointer_dy;
-                            let snap = s.compute_insertion_index(id, center_x, center_y);
-                            s.drag = Some(DragState::Reorder {
+                            // hide hover artifacts while moving
+                            s.hovered = None;
+                            s.proximity_hovered = None;
+
+                            let Some(it) = s.layout.items.iter().find(|it| it.id == id) else {
+                                s.drag = None;
+                                return;
+                            };
+
+                            let desired_x = px - grab_dx;
+                            let desired_y = py - grab_dy;
+                            let (snapped_x, snapped_y, snap_target_id, snap_kind) =
+                                s.compute_snapped_position(id, desired_x, desired_y, it.w, it.h);
+                            let draw_x = snapped_x.max(0.0);
+                            let draw_y = snapped_y.max(0.0);
+
+                            s.drag = Some(DragState::Move {
                                 id,
-                                pointer_dx,
-                                pointer_dy,
-                                insertion_index: snap.insertion_index,
+                                grab_dx,
+                                grab_dy,
                                 pointer_x: px,
                                 pointer_y: py,
-                                snap_mode: snap.mode,
-                                snap_target_id: snap.target_id,
+                                draw_x,
+                                draw_y,
+                                snap_target_id,
+                                snap_kind,
                             });
                         }
                         DragState::Resize {
@@ -1250,93 +1381,42 @@ fn App() -> impl IntoView {
                     return;
                 }
 
-                // reorder drag: keep center under pointer with offset
+                                // move drag: keep pointer offset relative to top-left
                 let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
-                let center_x = it.x + it.w / 2.0;
-                let center_y = it.y + it.h / 2.0;
-                let pointer_dx = px - center_x;
-                let pointer_dy = py - center_y;
-                let insertion = s.compute_insertion_index(id, center_x, center_y);
-                s.drag = Some(DragState::Reorder {
+                let grab_dx = px - it.x;
+                let grab_dy = py - it.y;
+
+                s.drag = Some(DragState::Move {
                     id,
-                    pointer_dx,
-                    pointer_dy,
-                    insertion_index: insertion.insertion_index,
+                    grab_dx,
+                    grab_dy,
                     pointer_x: px,
                     pointer_y: py,
-                    snap_mode: insertion.mode,
-                    snap_target_id: insertion.target_id,
+                    draw_x: it.x,
+                    draw_y: it.y,
+                    snap_target_id: None,
+                    snap_kind: SnapKind::None,
                 });
             });
         }
     };
 
     let on_pointer_up = {
-        move |_ev: PointerEvent| {
-            let mut started_transition = false;
-            state.update(|s| {
-                if let Some(DragState::Reorder {
-                    id,
-                    insertion_index,
-                    snap_mode,
-                    snap_target_id,
-                    ..
-                }) = s.drag.clone()
-                {
-                    let from_positions = s
-                        .layout
-                        .items
-                        .iter()
-                        .map(|it| (it.id, (it.x, it.y)))
-                        .collect::<HashMap<_, _>>();
-                    let snap = s.compute_insertion_index(
-                        id,
-                        s.drag
-                            .as_ref()
-                            .and_then(|d| match d {
-                                DragState::Reorder {
-                                    pointer_dx,
-                                    pointer_x,
-                                    ..
-                                } => Some(pointer_x - pointer_dx),
-                                _ => None,
-                            })
-                            .unwrap_or(0.0),
-                        s.drag
-                            .as_ref()
-                            .and_then(|d| match d {
-                                DragState::Reorder {
-                                    pointer_dy,
-                                    pointer_y,
-                                    ..
-                                } => Some(pointer_y - pointer_dy),
-                                _ => None,
-                            })
-                            .unwrap_or(0.0),
-                    );
-                    let final_snap = SnapDecision {
-                        insertion_index,
-                        mode: snap_mode,
-                        target_id: snap_target_id,
-                        row_indent: snap.row_indent,
-                    };
-                    s.reorder_by_insertion(id, final_snap);
-                    s.transition = Some(LayoutTransition {
-                        from_positions,
-                        start_ms: js_sys::Date::now(),
-                        duration_ms: 220.0,
-                    });
-                    started_transition = true;
+    move |_ev: PointerEvent| {
+        state.update(|s| {
+            if let Some(DragState::Move { id, draw_x, draw_y, .. }) = s.drag.clone() {
+                if let Some(img) = s.images.iter_mut().find(|i| i.id == id) {
+                    img.x = draw_x;
+                    img.y = draw_y;
                 }
-                s.drag = None;
-            });
-            if started_transition {
-                schedule_animation_tick(state);
+                s.recompute_layout();
             }
-        }
-    };
+            s.drag = None;
+        });
+    }
+};
 
-    // controls
+// controls
     let on_toggle_aspect = {
         move |ev| {
             let checked = event_target_checked(&ev);
@@ -1463,7 +1543,7 @@ fn App() -> impl IntoView {
                 ></canvas>
                 <div class="floating-hints">
                     <div>"Paste: Ctrl/Cmd+V"</div>
-                    <div>"Reorder: drag (including corner snap)"</div>
+                    <div>"Move: drag (snaps to edges/corners)"</div>
                     <div>"Resize: drag corner/side handle"</div>
                     <div>"Delete: hover image, click ×"</div>
                     <div>"Copy: Ctrl/Cmd+C"</div>
