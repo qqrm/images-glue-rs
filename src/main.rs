@@ -72,7 +72,7 @@ impl LayoutMode {
             "line" => LayoutMode::Line,
             "vertical" => LayoutMode::Vertical,
             "free" => LayoutMode::FreeFlow,
-            _ => LayoutMode::FreeFlow,
+            _ => LayoutMode::Line,
         }
     }
 }
@@ -184,7 +184,7 @@ impl Default for AppState {
             keep_aspect: true,
             slider: 0.5,
             export_format: ExportFormat::Jpeg,
-            layout_mode: LayoutMode::FreeFlow,
+            layout_mode: LayoutMode::Line,
             selected: None,
             hovered: None,
             proximity_hovered: None,
