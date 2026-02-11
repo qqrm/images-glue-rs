@@ -43,6 +43,40 @@ enum Handle {
     SW,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMode {
+    Line,
+    Vertical,
+    FreeFlow,
+}
+
+impl LayoutMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            LayoutMode::Line => "line",
+            LayoutMode::Vertical => "vertical",
+            LayoutMode::FreeFlow => "free",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Line => "Line",
+            LayoutMode::Vertical => "Vertical",
+            LayoutMode::FreeFlow => "Free flow",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "line" => LayoutMode::Line,
+            "vertical" => LayoutMode::Vertical,
+            "free" => LayoutMode::FreeFlow,
+            _ => LayoutMode::FreeFlow,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LayoutTransition {
     from_positions: HashMap<u64, (f64, f64)>,
@@ -66,35 +100,6 @@ struct ImageItem {
     // workspace position (top-left) in logical CSS px
     x: f64,
     y: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SnapMode {
-    Inline,
-    Bottom,
-    BottomRight,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SnapKind {
-    None,
-    Left,
-    Right,
-    Top,
-    Bottom,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
-
-
-#[derive(Clone, Copy, Debug)]
-struct SnapDecision {
-    insertion_index: usize,
-    mode: SnapMode,
-    target_id: Option<u64>,
-    row_indent: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +128,7 @@ struct AppState {
     keep_aspect: bool,
     slider: f64, // 0..1
     export_format: ExportFormat,
+    layout_mode: LayoutMode,
     selected: Option<u64>,
     hovered: Option<u64>,
     proximity_hovered: Option<u64>,
@@ -138,12 +144,16 @@ enum DragState {
         id: u64,
         grab_dx: f64, // pointer_x - item_x at drag start
         grab_dy: f64, // pointer_y - item_y at drag start
-        pointer_x: f64,
-        pointer_y: f64,
         draw_x: f64,
         draw_y: f64,
-        snap_target_id: Option<u64>,
-        snap_kind: SnapKind,
+    },
+    Reorder {
+        id: u64,
+        insertion_index: usize,
+        pointer_x: f64,
+        pointer_y: f64,
+        pointer_dx: f64,
+        pointer_dy: f64,
     },
     Resize {
         id: u64,
@@ -165,11 +175,7 @@ enum DragState {
 }
 
 const MIN_IMAGE_SIDE_PX: f64 = 48.0;
-const TILE_WRAP_WIDTH_PX: f64 = 1400.0;
 const PREVIEW_PADDING_PX: f64 = 12.0;
-const SNAP_DIST_PX: f64 = 14.0;
-const SNAP_CORNER_DIST_PX: f64 = 18.0;
-const SNAP_AXIS_GAP_PX: f64 = 64.0;
 
 impl Default for AppState {
     fn default() -> Self {
@@ -178,6 +184,7 @@ impl Default for AppState {
             keep_aspect: true,
             slider: 0.5,
             export_format: ExportFormat::Jpeg,
+            layout_mode: LayoutMode::FreeFlow,
             selected: None,
             hovered: None,
             proximity_hovered: None,
@@ -229,307 +236,213 @@ fn now_ts() -> String {
 }
 
 impl AppState {
-    fn recompute_layout(&mut self) {
-    let mut layout = Layout::default();
+    fn compute_targets(&self) -> (f64, f64) {
+        let mut h_min = f64::INFINITY;
+        let mut h_max: f64 = 0.0;
+        let mut w_min = f64::INFINITY;
+        let mut w_max: f64 = 0.0;
 
-    if self.images.is_empty() {
-        self.layout = layout;
-        return;
-    }
-
-    // compute h_min/h_max from natural heights
-    let mut h_min = f64::INFINITY;
-    let mut h_max: f64 = 0.0;
-    for img in &self.images {
-        h_min = h_min.min(img.nat_h);
-        h_max = h_max.max(img.nat_h);
-    }
-    if !h_min.is_finite() {
-        h_min = 1.0;
-    }
-
-    // slider S: 0 -> max, 1 -> min
-    let s = self.slider.clamp(0.0, 1.0);
-    let h_target = h_max * (1.0 - s) + h_min * s;
-
-    // sanitize/normalize positions: keep everything in non-negative space
-    for img in &mut self.images {
-        if !img.x.is_finite() {
-            img.x = 0.0;
+        for img in &self.images {
+            h_min = h_min.min(img.nat_h);
+            h_max = h_max.max(img.nat_h);
+            w_min = w_min.min(img.nat_w);
+            w_max = w_max.max(img.nat_w);
         }
-        if !img.y.is_finite() {
-            img.y = 0.0;
-        }
-    }
-    let min_x = self
-        .images
-        .iter()
-        .map(|i| i.x)
-        .fold(f64::INFINITY, f64::min);
-    let min_y = self
-        .images
-        .iter()
-        .map(|i| i.y)
-        .fold(f64::INFINITY, f64::min);
 
-    let shift_x = if min_x < 0.0 { -min_x } else { 0.0 };
-    let shift_y = if min_y < 0.0 { -min_y } else { 0.0 };
-    if shift_x != 0.0 || shift_y != 0.0 {
-        for img in &mut self.images {
-            img.x += shift_x;
-            img.y += shift_y;
+        if !h_min.is_finite() {
+            h_min = 1.0;
         }
+        if !w_min.is_finite() {
+            w_min = 1.0;
+        }
+
+        let s = self.slider.clamp(0.0, 1.0);
+        let h_target = h_max * (1.0 - s) + h_min * s;
+        let w_target = w_max * (1.0 - s) + w_min * s;
+        (h_target, w_target)
     }
 
-    // build layout from explicit positions (free 2D placement)
-    let mut out_w: f64 = 0.0;
-    let mut out_h: f64 = 0.0;
-
-    for img in &self.images {
+    fn base_size_for(&self, img: &ImageItem, h_target: f64, w_target: f64) -> (f64, f64) {
         let aspect = img.nat_w / img.nat_h;
-        let base_w = h_target * aspect;
-        let base_h = h_target;
+        match self.layout_mode {
+            LayoutMode::Line | LayoutMode::FreeFlow => {
+                let base_h = h_target;
+                let base_w = h_target * aspect;
+                (base_w, base_h)
+            }
+            LayoutMode::Vertical => {
+                let base_w = w_target;
+                let base_h = w_target / aspect;
+                (base_w, base_h)
+            }
+        }
+    }
 
-        let (w, h) = if self.keep_aspect {
+    fn final_size_for(&self, img: &ImageItem, base_w: f64, base_h: f64) -> (f64, f64) {
+        if self.keep_aspect {
             let k = img.k.max(0.01);
             (base_w * k, base_h * k)
         } else {
             let sx = img.sx.max(0.01);
             let sy = img.sy.max(0.01);
             (base_w * sx, base_h * sy)
-        };
-
-        let item_x = img.x;
-        let item_y = img.y;
-
-        let btn = {
-            let pad = 4.0;
-            let sz = 18.0;
-            (item_x + w - sz - pad, item_y + pad, sz, sz)
-        };
-
-        layout.items.push(LayoutItem {
-            id: img.id,
-            x: item_x,
-            y: item_y,
-            w,
-            h,
-            delete_btn: btn,
-        });
-
-        out_w = out_w.max(item_x + w);
-        out_h = out_h.max(item_y + h);
-    }
-
-    layout.out_w = out_w;
-    layout.out_h = out_h;
-
-    // Workspace should stay larger than glued content so images can be stretched to the right/bottom.
-    layout.view_w = (layout.out_w + 1200.0).max(1600.0);
-    layout.view_h = (layout.out_h + 900.0).max(900.0);
-
-    // warning: typical max canvas dimension (varies by browser/GPU)
-    layout.warn_too_large = layout.out_w > 16384.0 || layout.out_h > 16384.0;
-
-    self.layout = layout;
-
-    // clamp hovered/selected if items removed
-    let ids: std::collections::HashSet<u64> = self.images.iter().map(|i| i.id).collect();
-    if let Some(id) = self.selected && !ids.contains(&id) {
-        self.selected = None;
-    }
-    if let Some(id) = self.hovered && !ids.contains(&id) {
-        self.hovered = None;
-    }
-    if let Some(id) = self.proximity_hovered && !ids.contains(&id) {
-        self.proximity_hovered = None;
-    }
-}
-
-
-
-fn compute_snapped_position(
-    &self,
-    dragged_id: u64,
-    desired_x: f64,
-    desired_y: f64,
-    w: f64,
-    h: f64,
-) -> (f64, f64, Option<u64>, SnapKind) {
-    fn range_gap(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
-        if a1 < b0 {
-            b0 - a1
-        } else if b1 < a0 {
-            a0 - b1
-        } else {
-            0.0
         }
     }
 
-    let mut best_x = desired_x;
-    let mut best_y = desired_y;
-    let mut best_id: Option<u64> = None;
-    let mut best_kind = SnapKind::None;
-    let mut best_cost = SNAP_DIST_PX + 1.0;
+    fn recompute_layout(&mut self) {
+        let mut layout = Layout::default();
 
-    for it in &self.layout.items {
-        if it.id == dragged_id {
-            continue;
+        if self.images.is_empty() {
+            self.layout = layout;
+            return;
         }
 
-        let it_l = it.x;
-        let it_r = it.x + it.w;
-        let it_t = it.y;
-        let it_b = it.y + it.h;
+        let (h_target, w_target) = self.compute_targets();
 
-        let consider = |cand_x: f64,
-                        cand_y: f64,
-                        kind: SnapKind,
-                        threshold: f64,
-                        best_x: &mut f64,
-                        best_y: &mut f64,
-                        best_id: &mut Option<u64>,
-                        best_kind: &mut SnapKind,
-                        best_cost: &mut f64| {
-            let dx = cand_x - desired_x;
-            let dy = cand_y - desired_y;
-            let cost = (dx * dx + dy * dy).sqrt();
-            if cost <= threshold && cost < *best_cost {
-                *best_cost = cost;
-                *best_x = cand_x;
-                *best_y = cand_y;
-                *best_id = Some(it.id);
-                *best_kind = kind;
+        if self.layout_mode == LayoutMode::FreeFlow {
+            for img in &mut self.images {
+                if !img.x.is_finite() {
+                    img.x = 0.0;
+                }
+                if !img.y.is_finite() {
+                    img.y = 0.0;
+                }
             }
-        };
 
-        // Edge snaps (attach by a side).
-        // right: dragged.left -> it.right
+            let min_x = self
+                .images
+                .iter()
+                .map(|i| i.x)
+                .fold(f64::INFINITY, f64::min);
+            let min_y = self
+                .images
+                .iter()
+                .map(|i| i.y)
+                .fold(f64::INFINITY, f64::min);
+
+            let shift_x = if min_x < 0.0 { -min_x } else { 0.0 };
+            let shift_y = if min_y < 0.0 { -min_y } else { 0.0 };
+            if shift_x != 0.0 || shift_y != 0.0 {
+                for img in &mut self.images {
+                    img.x += shift_x;
+                    img.y += shift_y;
+                }
+            }
+        }
+
+        let mut out_w: f64 = 0.0;
+        let mut out_h: f64 = 0.0;
+
+        match self.layout_mode {
+            LayoutMode::Line => {
+                let mut x: f64 = 0.0;
+                for img in &self.images {
+                    let (base_w, base_h) = self.base_size_for(img, h_target, w_target);
+                    let (w, h) = self.final_size_for(img, base_w, base_h);
+                    let item_x = x;
+                    let item_y = 0.0;
+                    x += w;
+
+                    let btn = {
+                        let pad = 4.0;
+                        let sz = 18.0;
+                        (item_x + w - sz - pad, item_y + pad, sz, sz)
+                    };
+
+                    layout.items.push(LayoutItem {
+                        id: img.id,
+                        x: item_x,
+                        y: item_y,
+                        w,
+                        h,
+                        delete_btn: btn,
+                    });
+
+                    out_w = x;
+                    out_h = out_h.max(h);
+                }
+            }
+            LayoutMode::Vertical => {
+                let mut y: f64 = 0.0;
+                for img in &self.images {
+                    let (base_w, base_h) = self.base_size_for(img, h_target, w_target);
+                    let (w, h) = self.final_size_for(img, base_w, base_h);
+                    let item_x = 0.0;
+                    let item_y = y;
+                    y += h;
+
+                    let btn = {
+                        let pad = 4.0;
+                        let sz = 18.0;
+                        (item_x + w - sz - pad, item_y + pad, sz, sz)
+                    };
+
+                    layout.items.push(LayoutItem {
+                        id: img.id,
+                        x: item_x,
+                        y: item_y,
+                        w,
+                        h,
+                        delete_btn: btn,
+                    });
+
+                    out_h = y;
+                    out_w = out_w.max(w);
+                }
+            }
+            LayoutMode::FreeFlow => {
+                for img in &self.images {
+                    let (base_w, base_h) = self.base_size_for(img, h_target, w_target);
+                    let (w, h) = self.final_size_for(img, base_w, base_h);
+                    let item_x = img.x;
+                    let item_y = img.y;
+
+                    let btn = {
+                        let pad = 4.0;
+                        let sz = 18.0;
+                        (item_x + w - sz - pad, item_y + pad, sz, sz)
+                    };
+
+                    layout.items.push(LayoutItem {
+                        id: img.id,
+                        x: item_x,
+                        y: item_y,
+                        w,
+                        h,
+                        delete_btn: btn,
+                    });
+
+                    out_w = out_w.max(item_x + w);
+                    out_h = out_h.max(item_y + h);
+                }
+            }
+        }
+
+        layout.out_w = out_w;
+        layout.out_h = out_h;
+        layout.view_w = (layout.out_w + 1200.0).max(1600.0);
+        layout.view_h = (layout.out_h + 900.0).max(900.0);
+        layout.warn_too_large = layout.out_w > 16384.0 || layout.out_h > 16384.0;
+
+        self.layout = layout;
+
+        let ids: std::collections::HashSet<u64> = self.images.iter().map(|i| i.id).collect();
+        if let Some(id) = self.selected
+            && !ids.contains(&id)
         {
-            let cand_x = it_r;
-            let cand_y = desired_y;
-            let v_gap = range_gap(cand_y, cand_y + h, it_t, it_b);
-            if v_gap <= SNAP_AXIS_GAP_PX {
-                consider(
-                    cand_x,
-                    cand_y,
-                    SnapKind::Right,
-                    SNAP_DIST_PX,
-                    &mut best_x,
-                    &mut best_y,
-                    &mut best_id,
-                    &mut best_kind,
-                    &mut best_cost,
-                );
-            }
+            self.selected = None;
         }
-        // left: dragged.right -> it.left
+        if let Some(id) = self.hovered
+            && !ids.contains(&id)
         {
-            let cand_x = it_l - w;
-            let cand_y = desired_y;
-            let v_gap = range_gap(cand_y, cand_y + h, it_t, it_b);
-            if v_gap <= SNAP_AXIS_GAP_PX {
-                consider(
-                    cand_x,
-                    cand_y,
-                    SnapKind::Left,
-                    SNAP_DIST_PX,
-                    &mut best_x,
-                    &mut best_y,
-                    &mut best_id,
-                    &mut best_kind,
-                    &mut best_cost,
-                );
-            }
+            self.hovered = None;
         }
-        // bottom: dragged.top -> it.bottom
+        if let Some(id) = self.proximity_hovered
+            && !ids.contains(&id)
         {
-            let cand_x = desired_x;
-            let cand_y = it_b;
-            let h_gap = range_gap(cand_x, cand_x + w, it_l, it_r);
-            if h_gap <= SNAP_AXIS_GAP_PX {
-                consider(
-                    cand_x,
-                    cand_y,
-                    SnapKind::Bottom,
-                    SNAP_DIST_PX,
-                    &mut best_x,
-                    &mut best_y,
-                    &mut best_id,
-                    &mut best_kind,
-                    &mut best_cost,
-                );
-            }
+            self.proximity_hovered = None;
         }
-        // top: dragged.bottom -> it.top
-        {
-            let cand_x = desired_x;
-            let cand_y = it_t - h;
-            let h_gap = range_gap(cand_x, cand_x + w, it_l, it_r);
-            if h_gap <= SNAP_AXIS_GAP_PX {
-                consider(
-                    cand_x,
-                    cand_y,
-                    SnapKind::Top,
-                    SNAP_DIST_PX,
-                    &mut best_x,
-                    &mut best_y,
-                    &mut best_id,
-                    &mut best_kind,
-                    &mut best_cost,
-                );
-            }
-        }
-
-        // Corner snaps (attach by a corner).
-        consider(
-            it_r,
-            it_b,
-            SnapKind::BottomRight,
-            SNAP_CORNER_DIST_PX,
-            &mut best_x,
-            &mut best_y,
-            &mut best_id,
-            &mut best_kind,
-            &mut best_cost,
-        );
-        consider(
-            it_l - w,
-            it_b,
-            SnapKind::BottomLeft,
-            SNAP_CORNER_DIST_PX,
-            &mut best_x,
-            &mut best_y,
-            &mut best_id,
-            &mut best_kind,
-            &mut best_cost,
-        );
-        consider(
-            it_r,
-            it_t - h,
-            SnapKind::TopRight,
-            SNAP_CORNER_DIST_PX,
-            &mut best_x,
-            &mut best_y,
-            &mut best_id,
-            &mut best_kind,
-            &mut best_cost,
-        );
-        consider(
-            it_l - w,
-            it_t - h,
-            SnapKind::TopLeft,
-            SNAP_CORNER_DIST_PX,
-            &mut best_x,
-            &mut best_y,
-            &mut best_id,
-            &mut best_kind,
-            &mut best_cost,
-        );
     }
-
-    (best_x, best_y, best_id, best_kind)
-}
 
     fn hit_test_item(&self, px: f64, py: f64) -> Option<u64> {
         for it in &self.layout.items {
@@ -622,6 +535,48 @@ fn compute_snapped_position(
         self.drag = None;
         self.recompute_layout();
     }
+
+    fn reorder_by_insertion(&mut self, id: u64, insertion_index: usize) {
+        let Some(from) = self.images.iter().position(|i| i.id == id) else {
+            return;
+        };
+        let item = self.images.remove(from);
+        let to = insertion_index.min(self.images.len());
+        self.images.insert(to, item);
+        self.recompute_layout();
+    }
+
+    fn compute_insertion_index(
+        &self,
+        dragged_id: u64,
+        dragged_center: f64,
+        axis_is_vertical: bool,
+    ) -> usize {
+        let mut centers: Vec<f64> = self
+            .layout
+            .items
+            .iter()
+            .filter(|it| it.id != dragged_id)
+            .map(|it| {
+                if axis_is_vertical {
+                    it.y + it.h / 2.0
+                } else {
+                    it.x + it.w / 2.0
+                }
+            })
+            .collect();
+        centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut idx = 0usize;
+        for c in centers {
+            if dragged_center > c {
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        idx
+    }
 }
 
 fn schedule_animation_tick(state: RwSignal<AppState, leptos::prelude::LocalStorage>) {
@@ -678,7 +633,6 @@ fn set_canvas_size(
 
 fn render(state: &AppState, canvas: &HtmlCanvasElement) {
     let preview_pad = PREVIEW_PADDING_PX;
-    // Preview canvas is intentionally larger than content bounds.
     let w = (state.layout.view_w + preview_pad * 2.0).max(1.0);
     let h = (state.layout.view_h + preview_pad * 2.0).max(1.0);
 
@@ -686,17 +640,60 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         return;
     };
 
-    // Background (for preview): dark behind; canvas is actual output area.
-    // For JPEG export we will draw white, but preview remains neutral.
     ctx.clear_rect(0.0, 0.0, w, h);
 
-    // draw images
+    let reorder_preview = if let Some(DragState::Reorder {
+        id,
+        insertion_index,
+        pointer_x,
+        pointer_y,
+        ..
+    }) = &state.drag
+    {
+        let axis_is_vertical = state.layout_mode == LayoutMode::Vertical;
+        let mut packed = 0.0;
+        let mut idx = 0usize;
+        let mut preview_positions = HashMap::new();
+        let dragged_layout = state.layout.items.iter().find(|it| it.id == *id).cloned();
+
+        if let Some(dragged_layout) = dragged_layout {
+            for it in &state.layout.items {
+                if it.id == *id {
+                    continue;
+                }
+                if idx == *insertion_index {
+                    packed += if axis_is_vertical {
+                        dragged_layout.h
+                    } else {
+                        dragged_layout.w
+                    };
+                }
+                preview_positions.insert(it.id, packed);
+                packed += if axis_is_vertical { it.h } else { it.w };
+                idx += 1;
+            }
+
+            Some((
+                *id,
+                axis_is_vertical,
+                preview_positions,
+                *pointer_x,
+                *pointer_y,
+                dragged_layout,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     for it in &state.layout.items {
         let is_dragged = state
             .drag
             .as_ref()
             .and_then(|drag| match drag {
-                DragState::Move { id, .. } => Some(*id),
+                DragState::Move { id, .. } | DragState::Reorder { id, .. } => Some(*id),
                 _ => None,
             })
             .map(|dragged_id| dragged_id == it.id)
@@ -706,7 +703,20 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             continue;
         }
 
-        let draw_pos = if let Some(t) = &state.transition {
+        let draw_pos = if let Some((x, y)) =
+            reorder_preview
+                .as_ref()
+                .and_then(|(_, axis_is_vertical, map, _, _, _)| {
+                    map.get(&it.id).map(|packed| {
+                        if *axis_is_vertical {
+                            (0.0, *packed)
+                        } else {
+                            (*packed, 0.0)
+                        }
+                    })
+                }) {
+            (x, y)
+        } else if let Some(t) = &state.transition {
             let target = (it.x, it.y);
             let from = t.from_positions.get(&it.id).copied().unwrap_or(target);
             let p = ((js_sys::Date::now() - t.start_ms) / t.duration_ms).clamp(0.0, 1.0);
@@ -723,7 +733,6 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         let draw_y = draw_pos.1 + preview_pad;
 
         if let Some(img) = state.images.iter().find(|i| i.id == it.id) {
-            // draw the bitmap
             let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(
                 &img.bitmap,
                 draw_x,
@@ -732,7 +741,7 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
                 it.h,
             );
         }
-        // outline hover/selected
+
         let is_sel = state.selected == Some(it.id);
         let is_hov = state.hovered == Some(it.id);
         if is_sel || is_hov {
@@ -754,7 +763,6 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
             ctx.restore();
         }
 
-        // delete button on hover
         if is_hov {
             let (_bx, _by, bw, bh) = it.delete_btn;
             let bx = draw_x + it.w - bw - 4.0;
@@ -792,13 +800,11 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         }
     }
 
-    // draw handles for selected (or hovered if nothing selected)
-    // Hide while moving an image to avoid handle artifacts at the old position.
-    let dragging_move_id = state.drag.as_ref().and_then(|d| match d {
-        DragState::Move { id, .. } => Some(*id),
-        _ => None,
-    });
-    let handle_owner = if dragging_move_id.is_some() {
+    let dragging_non_resize = matches!(
+        state.drag,
+        Some(DragState::Move { .. } | DragState::Reorder { .. })
+    );
+    let handle_owner = if dragging_non_resize {
         None
     } else {
         state.selected.or(state.hovered).or(state.proximity_hovered)
@@ -842,12 +848,8 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.restore();
     }
 
-        // dragged image preview while moving
     if let Some(DragState::Move {
-        id,
-        draw_x,
-        draw_y,
-        ..
+        id, draw_x, draw_y, ..
     }) = &state.drag
         && let Some(it) = state.layout.items.iter().find(|it| it.id == *id)
         && let Some(dragged) = state.images.iter().find(|img| img.id == *id)
@@ -866,8 +868,25 @@ fn render(state: &AppState, canvas: &HtmlCanvasElement) {
         ctx.stroke_rect(cx + 0.5, cy + 0.5, it.w - 1.0, it.h - 1.0);
         ctx.restore();
     }
-}
 
+    if let Some((id, _, _, pointer_x, pointer_y, it)) = reorder_preview
+        && let Some(dragged) = state.images.iter().find(|img| img.id == id)
+    {
+        let cx = pointer_x - it.w / 2.0 + preview_pad;
+        let cy = pointer_y - it.h / 2.0 + preview_pad;
+        ctx.save();
+        let _ = ctx.draw_image_with_image_bitmap_and_dw_and_dh(&dragged.bitmap, cx, cy, it.w, it.h);
+        Reflect::set(
+            ctx.as_ref(),
+            &JsValue::from_str("strokeStyle"),
+            &JsValue::from_str("rgba(255,255,255,0.9)"),
+        )
+        .unwrap();
+        ctx.set_line_width(1.5);
+        ctx.stroke_rect(cx + 0.5, cy + 0.5, it.w - 1.0, it.h - 1.0);
+        ctx.restore();
+    }
+}
 
 async fn append_files(state: impl Update<Value = AppState> + Copy, files: Vec<File>) {
     for f in files {
@@ -1163,12 +1182,10 @@ fn App() -> impl IntoView {
             let Some(canvas) = canvas_ref.get() else {
                 return;
             };
-            // offsetX/Y in CSS px == logical units (we render in logical units).
             let px = ev.offset_x() as f64 - PREVIEW_PADDING_PX;
             let py = ev.offset_y() as f64 - PREVIEW_PADDING_PX;
 
             state.update(|s| {
-                // update hover
                 s.hovered = s.hit_test_item(px, py);
                 s.proximity_hovered = if s.hovered.is_none() {
                     s.hit_test_item_with_margin(px, py, 20.0)
@@ -1176,41 +1193,54 @@ fn App() -> impl IntoView {
                     None
                 };
 
-                // update drag
                 if let Some(d) = s.drag.clone() {
                     match d {
-                                                DragState::Move {
+                        DragState::Move {
                             id,
                             grab_dx,
                             grab_dy,
                             ..
                         } => {
-                            // hide hover artifacts while moving
                             s.hovered = None;
                             s.proximity_hovered = None;
-
-                            let Some(it) = s.layout.items.iter().find(|it| it.id == id) else {
-                                s.drag = None;
-                                return;
-                            };
-
-                            let desired_x = px - grab_dx;
-                            let desired_y = py - grab_dy;
-                            let (snapped_x, snapped_y, snap_target_id, snap_kind) =
-                                s.compute_snapped_position(id, desired_x, desired_y, it.w, it.h);
-                            let draw_x = snapped_x.max(0.0);
-                            let draw_y = snapped_y.max(0.0);
 
                             s.drag = Some(DragState::Move {
                                 id,
                                 grab_dx,
                                 grab_dy,
+                                draw_x: px - grab_dx,
+                                draw_y: py - grab_dy,
+                            });
+                        }
+                        DragState::Reorder {
+                            id,
+                            insertion_index: _,
+                            pointer_x: _,
+                            pointer_y: _,
+                            pointer_dx,
+                            pointer_dy,
+                        } => {
+                            s.hovered = None;
+                            s.proximity_hovered = None;
+
+                            let dragged_center_x = px - pointer_dx;
+                            let dragged_center_y = py - pointer_dy;
+                            let axis_is_vertical = s.layout_mode == LayoutMode::Vertical;
+                            let dragged_center = if axis_is_vertical {
+                                dragged_center_y
+                            } else {
+                                dragged_center_x
+                            };
+                            let insertion_index =
+                                s.compute_insertion_index(id, dragged_center, axis_is_vertical);
+
+                            s.drag = Some(DragState::Reorder {
+                                id,
+                                insertion_index,
                                 pointer_x: px,
                                 pointer_y: py,
-                                draw_x,
-                                draw_y,
-                                snap_target_id,
-                                snap_kind,
+                                pointer_dx,
+                                pointer_dy,
                             });
                         }
                         DragState::Resize {
@@ -1231,8 +1261,6 @@ fn App() -> impl IntoView {
                             let dx = px - start_pointer_x;
                             let dy = py - start_pointer_y;
 
-                            // derive target w/h from handle movement, using simple rules.
-                            // We keep layout packed; resizing only changes multipliers.
                             let mut target_w = start_w;
                             let mut target_h = start_h;
 
@@ -1263,7 +1291,6 @@ fn App() -> impl IntoView {
                                 let scale_w = target_w / base_w.max(1.0);
                                 let scale_h = target_h / base_h.max(1.0);
 
-                                // choose dominant axis for corners, axis-specific for sides
                                 let new_k = match handle {
                                     Handle::E | Handle::W => scale_w,
                                     Handle::N | Handle::S => scale_h,
@@ -1287,13 +1314,11 @@ fn App() -> impl IntoView {
                                 if let Some(img) = s.images.iter_mut().find(|i| i.id == id) {
                                     img.sx = new_sx;
                                     img.sy = new_sy;
-                                    // keep stored for completeness
-                                    let _ = (start_sx, start_sy, start_x, start_y);
+                                    let _ = (start_k, start_sx, start_sy, start_x, start_y);
                                 }
                             }
 
                             s.recompute_layout();
-                            // keep drag state live (with updated start box is not necessary for MVP)
                             s.drag = Some(DragState::Resize {
                                 id,
                                 handle,
@@ -1314,8 +1339,7 @@ fn App() -> impl IntoView {
                 }
             });
 
-            // request redraw by touching state; effect above will run.
-            let _ = canvas; // keep owned
+            let _ = canvas;
         }
     };
 
@@ -1333,7 +1357,6 @@ fn App() -> impl IntoView {
                     return;
                 };
 
-                // delete click
                 if s.hit_test_delete(id, px, py) {
                     s.remove_image(id);
                     return;
@@ -1341,27 +1364,16 @@ fn App() -> impl IntoView {
 
                 s.selected = Some(id);
 
-                // resize handle?
                 if let Some(h) = s.hit_test_handle(id, px, py) {
-                    // compute base sizes for this id at current slider
-                    let mut h_min = f64::INFINITY;
-                    let mut h_max: f64 = 0.0;
-                    for img in &s.images {
-                        h_min = h_min.min(img.nat_h);
-                        h_max = h_max.max(img.nat_h);
-                    }
-                    if !h_min.is_finite() {
-                        h_min = 1.0;
-                    }
-                    let ss = s.slider.clamp(0.0, 1.0);
-                    let h_target = h_max * (1.0 - ss) + h_min * ss;
-
-                    let img = s.images.iter().find(|i| i.id == id).unwrap();
-                    let aspect = img.nat_w / img.nat_h;
-                    let base_w = h_target * aspect;
-                    let base_h = h_target;
-
-                    let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
+                    let (h_target, w_target) = s.compute_targets();
+                    let img = s.images.iter().find(|i| i.id == id).expect("image");
+                    let (base_w, base_h) = s.base_size_for(img, h_target, w_target);
+                    let it = s
+                        .layout
+                        .items
+                        .iter()
+                        .find(|x| x.id == id)
+                        .expect("layout item");
 
                     s.drag = Some(DragState::Resize {
                         id,
@@ -1381,42 +1393,86 @@ fn App() -> impl IntoView {
                     return;
                 }
 
-                                // move drag: keep pointer offset relative to top-left
-                let it = s.layout.items.iter().find(|x| x.id == id).unwrap();
-                let grab_dx = px - it.x;
-                let grab_dy = py - it.y;
-
-                s.drag = Some(DragState::Move {
-                    id,
-                    grab_dx,
-                    grab_dy,
-                    pointer_x: px,
-                    pointer_y: py,
-                    draw_x: it.x,
-                    draw_y: it.y,
-                    snap_target_id: None,
-                    snap_kind: SnapKind::None,
-                });
+                let it = s
+                    .layout
+                    .items
+                    .iter()
+                    .find(|x| x.id == id)
+                    .expect("layout item");
+                if s.layout_mode == LayoutMode::FreeFlow {
+                    s.drag = Some(DragState::Move {
+                        id,
+                        grab_dx: px - it.x,
+                        grab_dy: py - it.y,
+                        draw_x: it.x,
+                        draw_y: it.y,
+                    });
+                } else {
+                    let center_x = it.x + it.w / 2.0;
+                    let center_y = it.y + it.h / 2.0;
+                    let pointer_dx = px - center_x;
+                    let pointer_dy = py - center_y;
+                    let axis_is_vertical = s.layout_mode == LayoutMode::Vertical;
+                    let dragged_center = if axis_is_vertical { center_y } else { center_x };
+                    let insertion_index =
+                        s.compute_insertion_index(id, dragged_center, axis_is_vertical);
+                    s.drag = Some(DragState::Reorder {
+                        id,
+                        insertion_index,
+                        pointer_x: px,
+                        pointer_y: py,
+                        pointer_dx,
+                        pointer_dy,
+                    });
+                }
             });
         }
     };
 
     let on_pointer_up = {
-    move |_ev: PointerEvent| {
-        state.update(|s| {
-            if let Some(DragState::Move { id, draw_x, draw_y, .. }) = s.drag.clone() {
-                if let Some(img) = s.images.iter_mut().find(|i| i.id == id) {
-                    img.x = draw_x;
-                    img.y = draw_y;
+        move |_ev: PointerEvent| {
+            let mut should_schedule_tick = false;
+            state.update(|s| {
+                match s.drag.clone() {
+                    Some(DragState::Move {
+                        id, draw_x, draw_y, ..
+                    }) => {
+                        if let Some(img) = s.images.iter_mut().find(|i| i.id == id) {
+                            img.x = draw_x;
+                            img.y = draw_y;
+                        }
+                        s.recompute_layout();
+                    }
+                    Some(DragState::Reorder {
+                        id,
+                        insertion_index,
+                        ..
+                    }) => {
+                        let from_positions = s
+                            .layout
+                            .items
+                            .iter()
+                            .map(|it| (it.id, (it.x, it.y)))
+                            .collect::<HashMap<_, _>>();
+                        s.reorder_by_insertion(id, insertion_index);
+                        s.transition = Some(LayoutTransition {
+                            from_positions,
+                            start_ms: js_sys::Date::now(),
+                            duration_ms: 180.0,
+                        });
+                        should_schedule_tick = true;
+                    }
+                    Some(DragState::Resize { .. }) | None => {}
                 }
-                s.recompute_layout();
+                s.drag = None;
+            });
+            if should_schedule_tick {
+                schedule_animation_tick(state);
             }
-            s.drag = None;
-        });
-    }
-};
+        }
+    };
 
-// controls
+    // controls
     let on_toggle_aspect = {
         move |ev| {
             let checked = event_target_checked(&ev);
@@ -1462,6 +1518,36 @@ fn App() -> impl IntoView {
         }
     };
 
+    let on_layout_mode = {
+        move |ev| {
+            let v = event_target_value(&ev);
+            let mut should_schedule_tick = false;
+            state.update(|s| {
+                let new_mode = LayoutMode::from_str(&v);
+                if s.layout_mode == new_mode {
+                    return;
+                }
+                let from_positions = s
+                    .layout
+                    .items
+                    .iter()
+                    .map(|it| (it.id, (it.x, it.y)))
+                    .collect::<HashMap<_, _>>();
+                s.layout_mode = new_mode;
+                s.recompute_layout();
+                s.transition = Some(LayoutTransition {
+                    from_positions,
+                    start_ms: js_sys::Date::now(),
+                    duration_ms: 180.0,
+                });
+                should_schedule_tick = true;
+            });
+            if should_schedule_tick {
+                schedule_animation_tick(state);
+            }
+        }
+    };
+
     let on_save_click = {
         move |_| {
             state.with(export_current);
@@ -1481,6 +1567,18 @@ fn App() -> impl IntoView {
 
     // Derived strings
     let warn = Memo::new(move |_| state.with(|s| s.layout.warn_too_large));
+    let slider_label = Memo::new(move |_| {
+        state.with(|s| match s.layout_mode {
+            LayoutMode::Vertical => "Size (width): largest → smallest",
+            LayoutMode::Line | LayoutMode::FreeFlow => "Size (height): largest → smallest",
+        })
+    });
+    let drag_hint = Memo::new(move |_| {
+        state.with(|s| match s.layout_mode {
+            LayoutMode::FreeFlow => "Move: drag",
+            LayoutMode::Line | LayoutMode::Vertical => "Reorder: drag",
+        })
+    });
 
     view! {
         <div class="main" on:dragover=on_drag_over on:drop=on_drop>
@@ -1507,11 +1605,23 @@ fn App() -> impl IntoView {
                 </label>
 
                 <label style="display:flex;flex-direction:column;gap:4px;">
-                    <span class="panel-label">"Size: largest → smallest"</span>
+                    <span class="panel-label">{move || slider_label.get()}</span>
                     <input type="range" min="0" max="1" step="0.01"
                         prop:value=move || state.with(|s| s.slider.to_string())
                         on:input=on_slider
                     />
+                </label>
+
+                <label style="display:flex;align-items:center;gap:8px;">
+                    <span class="panel-label">"Layout"</span>
+                    <select
+                        prop:value=move || state.with(|s| s.layout_mode.as_str().to_string())
+                        on:change=on_layout_mode
+                    >
+                        <option value="line">{LayoutMode::Line.label()}</option>
+                        <option value="vertical">{LayoutMode::Vertical.label()}</option>
+                        <option value="free">{LayoutMode::FreeFlow.label()}</option>
+                    </select>
                 </label>
 
                 <label style="display:flex;align-items:center;gap:8px;">
@@ -1543,7 +1653,7 @@ fn App() -> impl IntoView {
                 ></canvas>
                 <div class="floating-hints">
                     <div>"Paste: Ctrl/Cmd+V"</div>
-                    <div>"Move: drag (snaps to edges/corners)"</div>
+                    <div>{move || drag_hint.get()}</div>
                     <div>"Resize: drag corner/side handle"</div>
                     <div>"Delete: hover image, click ×"</div>
                     <div>"Copy: Ctrl/Cmd+C"</div>
