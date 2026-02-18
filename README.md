@@ -1,6 +1,6 @@
 https://qqrm.github.io/images-glue-rs
 
-#№ images-glue-rs
+## images-glue-rs
 
 A tiny browser tool to glue images into a single tiled canvas. Paste images from the clipboard,
 reorder by dragging, resize with optional aspect ratio lock, then export as JPEG or PNG.
